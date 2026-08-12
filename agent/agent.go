@@ -22,6 +22,8 @@ import (
 	"github.com/influxdata/telegraf/plugins/serializers/influx"
 )
 
+const finalWriteTimeout = 15 * time.Second
+
 // Agent runs a set of plugins.
 type Agent struct {
 	Config *config.Config
@@ -807,14 +809,14 @@ func (a *Agent) startOutputs(
 // connectOutput connects to all outputs.
 func (*Agent) connectOutput(ctx context.Context, output *models.RunningOutput) error {
 	log.Printf("D! [agent] Attempting connection to [%s]", output.LogName())
-	if err := output.Connect(); err != nil {
+	if err := output.ConnectContext(ctx); err != nil {
 		log.Printf("E! [agent] Failed to connect to [%s], retrying in 15s, error was %q", output.LogName(), err)
 
 		if err := internal.SleepContext(ctx, 15*time.Second); err != nil {
 			return err
 		}
 
-		if err = output.Connect(); err != nil {
+		if err = output.ConnectContext(ctx); err != nil {
 			return fmt.Errorf("error connecting to output %q: %w", output.LogName(), err)
 		}
 	}
@@ -896,36 +898,73 @@ func (a *Agent) flushLoop(ctx context.Context, output *models.RunningOutput, tim
 		// Favor shutdown over other methods.
 		select {
 		case <-ctx.Done():
-			logError(a.flushOnce(output, timer, output.Write))
+			finalCtx, cancel := finalFlushContext(ctx, output, finalWriteTimeout)
+			logError(a.flushOnce(finalCtx, output, timer, output.WriteContext))
+			cancel()
 			return
 		default:
 		}
 
 		select {
 		case <-ctx.Done():
-			logError(a.flushOnce(output, timer, output.Write))
+			finalCtx, cancel := finalFlushContext(ctx, output, finalWriteTimeout)
+			logError(a.flushOnce(finalCtx, output, timer, output.WriteContext))
+			cancel()
 			return
 		case <-timer.C:
-			logError(a.flushOnce(output, timer, output.Write))
+			logError(a.flushOnce(ctx, output, timer, output.WriteContext))
 		case <-flushRequested:
-			logError(a.flushOnce(output, timer, output.Write))
+			logError(a.flushOnce(ctx, output, timer, output.WriteContext))
 		case <-output.BatchReady:
-			logError(a.flushBatch(output, output.WriteBatch))
+			logError(a.flushBatch(ctx, output, output.WriteBatchContext))
 		}
 	}
 }
 
+func finalFlushContext(
+	shutdownCtx context.Context,
+	output *models.RunningOutput,
+	defaultTimeout time.Duration,
+) (context.Context, context.CancelFunc) {
+	if _, ok := output.Output.(telegraf.OutputWithContext); ok {
+		if output.Config.WriteTimeout > 0 {
+			// flushOnce applies the configured deadline to this fresh final attempt.
+			return context.Background(), func() {}
+		}
+		// Shutdown has already cancelled shutdownCtx. Use a fresh bounded context
+		// so context-aware outputs get one real final delivery attempt.
+		return context.WithTimeout(context.Background(), defaultTimeout)
+	}
+	return shutdownCtx, func() {}
+}
+
 // flushOnce runs the output's Write function once, logging a warning each interval it fails to complete before the flush interval elapses.
-func (*Agent) flushOnce(output *models.RunningOutput, timer *clock.Timer, writeFunc func() error) error {
-	done := make(chan error)
+func (*Agent) flushOnce(ctx context.Context, output *models.RunningOutput, timer *clock.Timer, writeFunc func(context.Context) error) error {
+	done := make(chan error, 1)
+
+	writeCtx := ctx
+	var cancel context.CancelFunc
+	if output.Config.WriteTimeout > 0 {
+		writeCtx, cancel = context.WithTimeout(ctx, output.Config.WriteTimeout)
+		defer cancel()
+	}
+
 	go func() {
-		done <- writeFunc()
+		done <- writeFunc(writeCtx)
 	}()
 
 	for {
 		select {
 		case err := <-done:
 			output.LogBufferStatus()
+			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					return fmt.Errorf("write deadline exceeded: %w", err)
+				}
+				if errors.Is(err, context.Canceled) {
+					return fmt.Errorf("write cancelled: %w", err)
+				}
+			}
 			return err
 		case <-timer.C:
 			log.Printf("W! [agent] [%q] did not complete within its flush interval",
@@ -936,9 +975,26 @@ func (*Agent) flushOnce(output *models.RunningOutput, timer *clock.Timer, writeF
 }
 
 // flushBatch runs the output's Write function once Unlike flushOnce the interval elapsing is not considered during these flushes.
-func (*Agent) flushBatch(output *models.RunningOutput, writeFunc func() error) error {
-	err := writeFunc()
+func (*Agent) flushBatch(ctx context.Context, output *models.RunningOutput, writeFunc func(context.Context) error) error {
+	writeCtx := ctx
+	var cancel context.CancelFunc
+	if output.Config.WriteTimeout > 0 {
+		writeCtx, cancel = context.WithTimeout(ctx, output.Config.WriteTimeout)
+		defer cancel()
+	}
+
+	err := writeFunc(writeCtx)
 	output.LogBufferStatus()
+
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("write deadline exceeded: %w", err)
+		}
+		if errors.Is(err, context.Canceled) {
+			return fmt.Errorf("write cancelled: %w", err)
+		}
+	}
+
 	return err
 }
 

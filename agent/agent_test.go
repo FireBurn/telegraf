@@ -270,3 +270,99 @@ func collect(ctx context.Context, a *Agent, wait time.Duration) ([]telegraf.Metr
 	}
 	return received, nil
 }
+
+func TestFinalFlushContext(t *testing.T) {
+	shutdownCtx, shutdown := context.WithCancel(t.Context())
+	shutdown()
+
+	t.Run("context-aware default", func(t *testing.T) {
+		output := &models.RunningOutput{Output: &contextOutput{}, Config: &models.OutputConfig{}}
+		ctx, cancel := finalFlushContext(shutdownCtx, output, 100*time.Millisecond)
+		defer cancel()
+		require.NoError(t, ctx.Err())
+		deadline, ok := ctx.Deadline()
+		require.True(t, ok)
+		require.WithinDuration(t, time.Now().Add(100*time.Millisecond), deadline, 25*time.Millisecond)
+	})
+
+	t.Run("context-aware configured timeout", func(t *testing.T) {
+		output := &models.RunningOutput{
+			Output: &contextOutput{},
+			Config: &models.OutputConfig{WriteTimeout: 250 * time.Millisecond},
+		}
+		ctx, cancel := finalFlushContext(shutdownCtx, output, time.Second)
+		defer cancel()
+		require.NoError(t, ctx.Err())
+		_, ok := ctx.Deadline()
+		require.False(t, ok, "flushOnce should apply the single configured deadline")
+	})
+
+	t.Run("legacy", func(t *testing.T) {
+		output := &models.RunningOutput{Output: &legacyOutput{}, Config: &models.OutputConfig{}}
+		ctx, cancel := finalFlushContext(shutdownCtx, output, 100*time.Millisecond)
+		defer cancel()
+		require.ErrorIs(t, ctx.Err(), context.Canceled)
+	})
+}
+
+func TestFinalFlushContextBoundsWrite(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	plugin := &contextOutput{entered: entered}
+	output := &models.RunningOutput{Output: plugin, Config: &models.OutputConfig{}}
+	ctx, cancel := finalFlushContext(context.Background(), output, 25*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := plugin.WriteContext(ctx, nil)
+	require.NotEmpty(t, entered)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, time.Since(start), 500*time.Millisecond)
+}
+
+func TestConnectOutputCancellation(t *testing.T) {
+	plugin := &connectContextOutput{entered: make(chan struct{})}
+	output, err := models.NewRunningOutput(plugin, &models.OutputConfig{Name: "test"}, 5, 10)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() { result <- (&Agent{}).connectOutput(ctx, output) }()
+	<-plugin.entered
+	cancel()
+	require.ErrorIs(t, <-result, context.Canceled)
+}
+
+type legacyOutput struct{}
+
+func (*legacyOutput) Connect() error                { return nil }
+func (*legacyOutput) Close() error                  { return nil }
+func (*legacyOutput) SampleConfig() string          { return "" }
+func (*legacyOutput) Write([]telegraf.Metric) error { return nil }
+func (*legacyOutput) Description() string           { return "" }
+func (*legacyOutput) Init() error                   { return nil }
+
+type contextOutput struct {
+	legacyOutput
+	entered chan<- struct{}
+}
+
+type connectContextOutput struct {
+	legacyOutput
+	entered chan struct{}
+}
+
+func (o *connectContextOutput) ConnectContext(ctx context.Context) error {
+	close(o.entered)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (o *contextOutput) WriteContext(ctx context.Context, _ []telegraf.Metric) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("context cancelled before final write: %w", err)
+	}
+	if o.entered != nil {
+		o.entered <- struct{}{}
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}

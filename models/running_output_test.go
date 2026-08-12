@@ -1,8 +1,10 @@
 package models
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
+	logging "github.com/influxdata/telegraf/logger"
 	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/selfstat"
 	"github.com/influxdata/telegraf/testutil"
@@ -961,6 +964,90 @@ func TestRunningOutputRetryableStartupBehaviorIgnore(t *testing.T) {
 	require.False(t, ro.started)
 }
 
+func TestRunningOutputConnectContextCancellation(t *testing.T) {
+	plugin := &contextConnectOutput{connect: func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	ro, err := NewRunningOutput(plugin, &OutputConfig{Filter: Filter{}, Name: "test"}, 5, 10)
+	require.NoError(t, err)
+
+	before := ro.StartupErrors.Get()
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancel()
+	err = ro.ConnectContext(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.NotErrorIs(t, err, internal.ErrNotConnected)
+	require.Equal(t, before, ro.StartupErrors.Get())
+	require.False(t, ro.started)
+}
+
+func TestRunningOutputConnectContextInternalDeadlineIsStartupFailure(t *testing.T) {
+	plugin := &contextConnectOutput{connect: func(context.Context) error {
+		return context.DeadlineExceeded
+	}}
+	ro, err := NewRunningOutput(plugin, &OutputConfig{Filter: Filter{}, Name: "test"}, 5, 10)
+	require.NoError(t, err)
+
+	before := ro.StartupErrors.Get()
+	err = ro.ConnectContext(t.Context())
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, before+1, ro.StartupErrors.Get())
+}
+
+func TestRunningOutputConnectContextCancellationIgnoresStartupBehavior(t *testing.T) {
+	plugin := &contextConnectOutput{connect: func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	ro, err := NewRunningOutput(plugin, &OutputConfig{
+		Filter: Filter{}, Name: "test", StartupErrorBehavior: "ignore",
+	}, 5, 10)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	err = ro.ConnectContext(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	var fatalErr *internal.FatalError
+	require.NotErrorAs(t, err, &fatalErr)
+}
+
+func TestRunningOutputWriteContextsCancelConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		write func(*RunningOutput, context.Context) error
+	}{
+		{name: "write", write: (*RunningOutput).WriteContext},
+		{name: "batch", write: (*RunningOutput).WriteBatchContext},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plugin := &contextConnectOutput{connect: func(ctx context.Context) error {
+				<-ctx.Done()
+				return ctx.Err()
+			}}
+			ro, err := NewRunningOutput(plugin, &OutputConfig{Filter: Filter{}, Name: "test"}, 5, 10)
+			require.NoError(t, err)
+			before := ro.StartupErrors.Get()
+
+			ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+			defer cancel()
+			err = tc.write(ro, ctx)
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+			require.NotErrorIs(t, err, internal.ErrNotConnected)
+			require.Equal(t, before, ro.StartupErrors.Get())
+		})
+	}
+}
+
+func TestRunningOutputConnectContextLegacyOutput(t *testing.T) {
+	plugin := &mockOutput{}
+	ro, err := NewRunningOutput(plugin, &OutputConfig{Filter: Filter{}, Name: "test"}, 5, 10)
+	require.NoError(t, err)
+	require.NoError(t, ro.ConnectContext(t.Context()))
+	require.True(t, ro.started)
+}
+
 func TestRunningOutputNonRetryableStartupBehaviorDefault(t *testing.T) {
 	serr := &internal.StartupError{
 		Err:   errors.New("non-retryable err"),
@@ -1404,6 +1491,15 @@ type mockOutput struct {
 	Log           telegraf.Logger
 }
 
+type contextConnectOutput struct {
+	mockOutput
+	connect func(context.Context) error
+}
+
+func (o *contextConnectOutput) ConnectContext(ctx context.Context) error {
+	return o.connect(ctx)
+}
+
 func (m *mockOutput) Connect() error {
 	if m.startupErrorCount == 0 {
 		return nil
@@ -1496,4 +1592,73 @@ func (m *perfOutput) Write([]telegraf.Metric) error {
 		return errors.New("failed write")
 	}
 	return nil
+}
+
+// writeContextOutput is an output that supports bounded writes.
+type writeContextOutput struct {
+	mockOutput
+}
+
+func (m *writeContextOutput) WriteContext(_ context.Context, metrics []telegraf.Metric) error {
+	return m.Write(metrics)
+}
+
+// connectContextOutput is an output that supports only bounded connects.
+type connectContextOutput struct {
+	mockOutput
+}
+
+func (m *connectContextOutput) ConnectContext(context.Context) error {
+	return m.Connect()
+}
+
+// A write_timeout on a plugin the agent cannot bound does nothing at all, so
+// it must not pass silently.
+func TestRunningOutputWriteTimeoutUnsupportedWarns(t *testing.T) {
+	tests := []struct {
+		name       string
+		output     telegraf.Output
+		timeout    time.Duration
+		expectWarn bool
+	}{
+		{
+			name:       "unsupported plugin warns",
+			output:     &mockOutput{},
+			timeout:    time.Second,
+			expectWarn: true,
+		},
+		{
+			name:    "unsupported plugin without the option stays quiet",
+			output:  &mockOutput{},
+			timeout: 0,
+		},
+		{
+			name:    "bounded writes stay quiet",
+			output:  &writeContextOutput{},
+			timeout: time.Second,
+		},
+		{
+			name:    "bounded connects stay quiet",
+			output:  &connectContextOutput{},
+			timeout: time.Second,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf := &bytes.Buffer{}
+			logging.RedirectLogging(buf)
+			defer logging.RedirectLogging(os.Stderr)
+
+			conf := &OutputConfig{Name: "test_unbounded", WriteTimeout: tt.timeout}
+			_, err := NewRunningOutput(tt.output, conf, 1000, 10000)
+			require.NoError(t, err)
+
+			if tt.expectWarn {
+				require.Contains(t, buf.String(), "'write_timeout' is set but plugin \"test_unbounded\" does not support it")
+			} else {
+				require.NotContains(t, buf.String(), "write_timeout")
+			}
+		})
+	}
 }

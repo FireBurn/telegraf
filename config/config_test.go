@@ -169,6 +169,17 @@ func TestConfig_InputCollectionJitterExplicitZeroIsSet(t *testing.T) {
 	require.False(t, c.Inputs[1].Config.CollectionJitterSet)
 }
 
+func TestConfig_OutputWriteTimeout(t *testing.T) {
+	c := config.NewConfig()
+	cfg := []byte(`
+[[outputs.http]]
+  write_timeout = "3s"
+`)
+	require.NoError(t, c.LoadConfigData(cfg, config.EmptySourcePath))
+	require.Len(t, c.Outputs, 1)
+	require.Equal(t, 3*time.Second, c.Outputs[0].Config.WriteTimeout)
+}
+
 func TestConfig_LoadSingleInput_WithSeparators(t *testing.T) {
 	c := config.NewConfig()
 	confFile := filepath.Join("testdata", "single_plugin_with_separators.toml")

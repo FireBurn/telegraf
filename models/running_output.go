@@ -1,6 +1,7 @@
 package models
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -34,6 +35,7 @@ type OutputConfig struct {
 
 	FlushInterval     time.Duration
 	FlushJitter       time.Duration
+	WriteTimeout      time.Duration
 	MetricBufferLimit int
 	MetricBatchSize   int
 
@@ -109,6 +111,20 @@ func NewRunningOutput(output telegraf.Output, config *OutputConfig, batchSize, b
 		batchSize = DefaultMetricBatchSize
 	}
 
+	// 'write_timeout' is enforced by the agent wrapping the context-aware
+	// entry points, so it silently does nothing for a plugin that implements
+	// neither. Say so rather than letting users believe a hanging output is
+	// bounded when it is not.
+	if config.WriteTimeout > 0 {
+		_, boundedWrite := output.(telegraf.OutputWithContext)
+		_, boundedConnect := output.(telegraf.OutputWithConnectContext)
+		if !boundedWrite && !boundedConnect {
+			logger.Warnf("'write_timeout' is set but plugin %q does not support it, so writes and "+
+				"connections remain unbounded; see docs/specs/tsd-012-output-context-aware-write.md",
+				config.Name)
+		}
+	}
+
 	b, err := NewBuffer(config.Name, config.ID, config.Alias, bufferLimit, config.BufferStrategy, config.BufferDirectory, config.BufferDiskSync)
 	if err != nil {
 		return nil, fmt.Errorf("creating buffer failed: %w", err)
@@ -180,11 +196,19 @@ func (r *RunningOutput) Init() error {
 }
 
 func (r *RunningOutput) Connect() error {
+	return r.ConnectContext(context.Background())
+}
+
+// ConnectContext connects the output, passing the context to plugins supporting it.
+func (r *RunningOutput) ConnectContext(ctx context.Context) error {
 	// Try to connect and exit early on success
-	err := r.Output.Connect()
+	err := r.connectPlugin(ctx)
 	if err == nil {
 		r.started = true
 		return nil
+	}
+	if ctx.Err() != nil {
+		return err
 	}
 	r.StartupErrors.Incr(1)
 
@@ -207,6 +231,13 @@ func (r *RunningOutput) Connect() error {
 	}
 
 	return err
+}
+
+func (r *RunningOutput) connectPlugin(ctx context.Context) error {
+	if output, ok := r.Output.(telegraf.OutputWithConnectContext); ok {
+		return output.ConnectContext(ctx)
+	}
+	return r.Output.Connect()
 }
 
 // Close closes the output
@@ -300,10 +331,18 @@ func (r *RunningOutput) triggerBatchCheck() {
 // Write writes all metrics to the output, stopping when all have been sent on
 // or error.
 func (r *RunningOutput) Write() error {
+	return r.WriteContext(context.Background())
+}
+
+// WriteContext writes all metrics to the output, passing the context to the plugin.
+func (r *RunningOutput) WriteContext(ctx context.Context) error {
 	// Try to connect if we are not yet started up
 	if !r.started {
 		r.retries++
-		if err := r.Output.Connect(); err != nil {
+		if err := r.connectPlugin(ctx); err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
 			var serr *internal.StartupError
 			if !errors.As(err, &serr) || !serr.Retry || !serr.Partial {
 				r.StartupErrors.Incr(1)
@@ -338,7 +377,7 @@ func (r *RunningOutput) Write() error {
 	nBuffer := r.buffer.Len()
 	nBatches := nBuffer/r.MetricBatchSize + 1
 	for i := 0; i < nBatches; i++ {
-		if err := r.doTransaction(); err != nil {
+		if err := r.doTransaction(ctx); err != nil {
 			return err
 		}
 	}
@@ -347,10 +386,18 @@ func (r *RunningOutput) Write() error {
 
 // WriteBatch writes a single batch of metrics to the output.
 func (r *RunningOutput) WriteBatch() error {
+	return r.WriteBatchContext(context.Background())
+}
+
+// WriteBatchContext writes a single batch of metrics to the output, passing the context.
+func (r *RunningOutput) WriteBatchContext(ctx context.Context) error {
 	// Try to connect if we are not yet started up
 	if !r.started {
 		r.retries++
-		if err := r.Output.Connect(); err != nil {
+		if err := r.connectPlugin(ctx); err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
 			r.StartupErrors.Incr(1)
 			return internal.ErrNotConnected
 		}
@@ -366,15 +413,15 @@ func (r *RunningOutput) WriteBatch() error {
 		r.triggerBatchCheck()
 	}()
 
-	return r.doTransaction()
+	return r.doTransaction(ctx)
 }
 
-func (r *RunningOutput) doTransaction() error {
+func (r *RunningOutput) doTransaction(ctx context.Context) error {
 	tx := r.buffer.BeginTransaction(r.MetricBatchSize)
 	if len(tx.Batch) == 0 {
 		return nil
 	}
-	err := r.writeMetrics(tx.Batch)
+	err := r.writeMetrics(ctx, tx.Batch)
 	r.updateTransaction(tx, err)
 	r.buffer.EndTransaction(tx)
 
@@ -387,14 +434,19 @@ func (r *RunningOutput) doTransaction() error {
 	return nil
 }
 
-func (r *RunningOutput) writeMetrics(metrics []telegraf.Metric) error {
+func (r *RunningOutput) writeMetrics(ctx context.Context, metrics []telegraf.Metric) error {
 	if dropped := r.droppedMetrics.Load(); dropped > 0 {
 		r.log.Warnf("Metric buffer overflow; %d metrics have been dropped", dropped)
 		r.droppedMetrics.Add(-dropped)
 	}
 
 	start := time.Now()
-	err := r.Output.Write(metrics)
+	var err error
+	if ctxOut, ok := r.Output.(telegraf.OutputWithContext); ok {
+		err = ctxOut.WriteContext(ctx, metrics)
+	} else {
+		err = r.Output.Write(metrics)
+	}
 	elapsed := time.Since(start)
 	r.WriteTime.Incr(elapsed.Nanoseconds())
 

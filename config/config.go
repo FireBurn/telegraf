@@ -1787,6 +1787,7 @@ func (c *Config) buildOutput(name, source string, tbl *ast.Table) (*models.Outpu
 
 	oc.FlushInterval, _ = c.getFieldDuration(tbl, "flush_interval")
 	oc.FlushJitter, _ = c.getFieldDuration(tbl, "flush_jitter")
+	oc.WriteTimeout, _ = c.getFieldDuration(tbl, "write_timeout")
 	oc.MetricBufferLimit = c.getFieldInt(tbl, "metric_buffer_limit")
 	oc.MetricBatchSize = c.getFieldInt(tbl, "metric_batch_size")
 	oc.Alias = c.getFieldString(tbl, "alias")
@@ -1829,7 +1830,8 @@ func (c *Config) missingTomlField(_ reflect.Type, key string) error {
 		"name_override", "name_prefix", "name_suffix", "namedrop", "namedrop_separator", "namepass", "namepass_separator",
 		"order",
 		"pass", "period", "precision",
-		"tagdrop", "tagexclude", "taginclude", "tagpass", "tags", "startup_error_behavior", "labels":
+		"tagdrop", "tagexclude", "taginclude", "tagpass", "tags", "startup_error_behavior", "labels",
+		"write_timeout":
 
 	// secret store options to ignore
 	case "id":

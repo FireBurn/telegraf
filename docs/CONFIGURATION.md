@@ -523,6 +523,13 @@ Parameters that can be used with any output plugin:
 - **metric_buffer_limit**: The maximum number of unsent metrics to buffer.
   Use this setting to override the agent `metric_buffer_limit` on a per plugin
   basis.
+- **write_timeout**: The maximum time allowed for one output write. A value of
+  `0s` (the default) disables the deadline. The deadline can only interrupt
+  plugins implementing the optional context-aware output interface; the
+  plugin's README states whether this option is supported. A cancelled write
+  is retained for retry, but an ambiguous delivery outcome can result in
+  duplicate metrics. On shutdown, context-aware outputs receive one final
+  write attempt bounded by `write_timeout`, or 15 seconds when it is unset.
 - **name_override**: Override the original name of the measurement.
 - **name_prefix**: Specifies a prefix to attach to the measurement name.
 - **name_suffix**: Specifies a suffix to attach to the measurement name.
@@ -551,6 +558,11 @@ Override flush parameters for a single output:
   flush_interval = "1s"
   flush_jitter = "1s"
   metric_batch_size = 10
+
+[[outputs.kafka]]
+  brokers = ["localhost:9092"]
+  topic = "metrics"
+  write_timeout = "30s"
 ```
 
 ### Processor Plugins
