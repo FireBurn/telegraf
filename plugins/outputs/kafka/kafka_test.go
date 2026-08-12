@@ -1,7 +1,10 @@
 package kafka
 
 import (
+	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +14,7 @@ import (
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/metric"
+	"github.com/influxdata/telegraf/models"
 	"github.com/influxdata/telegraf/plugins/serializers/influx"
 	"github.com/influxdata/telegraf/testutil"
 )
@@ -365,6 +369,425 @@ func TestHeaders(t *testing.T) {
 			require.ElementsMatch(t, tt.expected, message.Headers)
 		})
 	}
+}
+
+func TestWriteContext(t *testing.T) {
+	tests := []struct {
+		name     string
+		sendErr  error
+		expected error
+	}{
+		{name: "success"},
+		{name: "producer error", sendErr: sarama.ErrNotConnected, expected: sarama.ErrNotConnected},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			producer := &controlledProducer{sendErr: tt.sendErr}
+			plugin := newTestPlugin(t, func([]string, *sarama.Config) (sarama.SyncProducer, error) {
+				return producer, nil
+			})
+
+			err := plugin.WriteContext(t.Context(), testutil.MockMetrics())
+			if tt.expected == nil {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, tt.expected)
+			}
+			require.Equal(t, int32(1), producer.sends.Load())
+		})
+	}
+}
+
+func TestWriteContextCancellationDoesNotWaitForProducer(t *testing.T) {
+	sendBlock := make(chan struct{})
+	closeBlock := make(chan struct{})
+	producer := &controlledProducer{sendBlock: sendBlock, closeBlock: closeBlock}
+	plugin := newTestPlugin(t, func([]string, *sarama.Config) (sarama.SyncProducer, error) {
+		return producer, nil
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := plugin.WriteContext(ctx, testutil.MockMetrics())
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, time.Since(start), 500*time.Millisecond)
+
+	// Release the fake only after proving that neither SendMessages nor Close
+	// is on the cancellation path.
+	close(sendBlock)
+	close(closeBlock)
+}
+
+func TestWriteContextReplacesPoisonedProducer(t *testing.T) {
+	oldSendBlock := make(chan struct{})
+	oldCloseBlock := make(chan struct{})
+	oldProducer := &controlledProducer{sendBlock: oldSendBlock, closeBlock: oldCloseBlock}
+	newProducer := &controlledProducer{}
+	producers := []sarama.SyncProducer{oldProducer, newProducer}
+	var created atomic.Int32
+	plugin := newTestPlugin(t, func([]string, *sarama.Config) (sarama.SyncProducer, error) {
+		return producers[int(created.Add(1))-1], nil
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, plugin.WriteContext(ctx, testutil.MockMetrics()), context.DeadlineExceeded)
+	require.NoError(t, plugin.WriteContext(t.Context(), testutil.MockMetrics()))
+	require.Equal(t, int32(1), newProducer.sends.Load())
+
+	// Cleanup from the old write must only ever close the old generation.
+	require.Eventually(t, func() bool { return oldProducer.closes.Load() == 1 }, time.Second, time.Millisecond)
+	require.Zero(t, newProducer.closes.Load())
+	close(oldSendBlock)
+	close(oldCloseBlock)
+}
+
+func TestWriteContextCancellationRaceKeepsReplacement(t *testing.T) {
+	sendBlock := make(chan struct{})
+	closeBlock := make(chan struct{})
+	oldProducer := &controlledProducer{sendBlock: sendBlock, closeBlock: closeBlock}
+	newProducer := &controlledProducer{}
+	producers := []sarama.SyncProducer{oldProducer, newProducer}
+	var created atomic.Int32
+	plugin := newTestPlugin(t, func([]string, *sarama.Config) (sarama.SyncProducer, error) {
+		return producers[int(created.Add(1))-1], nil
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() { result <- plugin.WriteContext(ctx, testutil.MockMetrics()) }()
+	require.Eventually(t, func() bool { return oldProducer.sends.Load() == 1 }, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-result, context.Canceled)
+	require.NoError(t, plugin.WriteContext(t.Context(), testutil.MockMetrics()))
+	close(sendBlock)
+	close(closeBlock)
+	require.Eventually(t, func() bool { return oldProducer.closes.Load() == 1 }, time.Second, time.Millisecond)
+	require.Zero(t, newProducer.closes.Load())
+}
+
+func TestWriteContextBoundsPoisonedProducers(t *testing.T) {
+	blocks := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	producers := []sarama.SyncProducer{
+		&controlledProducer{sendBlock: blocks[0], closeBlock: blocks[0]},
+		&controlledProducer{sendBlock: blocks[1], closeBlock: blocks[1]},
+	}
+	var created atomic.Int32
+	plugin := newTestPlugin(t, func([]string, *sarama.Config) (sarama.SyncProducer, error) {
+		return producers[int(created.Add(1))-1], nil
+	})
+	logger := &testutil.CaptureLogger{}
+	plugin.Log = logger
+
+	for range producers {
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+		require.ErrorIs(t, plugin.WriteContext(ctx, testutil.MockMetrics()), context.DeadlineExceeded)
+		cancel()
+	}
+	start := time.Now()
+	err := plugin.WriteContext(t.Context(), testutil.MockMetrics())
+	require.ErrorContains(t, err, "replacement limit reached")
+	require.Less(t, time.Since(start), 100*time.Millisecond)
+	require.Equal(t, int32(2), created.Load())
+	require.Len(t, logger.Errors(), 1)
+	require.Contains(t, logger.Errors()[0], "Kafka producer replacement limit reached")
+	require.Error(t, plugin.WriteContext(t.Context(), testutil.MockMetrics()))
+	require.Len(t, logger.Errors(), 1)
+
+	for _, block := range blocks {
+		close(block)
+	}
+}
+
+func TestWriteContextBoundsProducerCreation(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	producer := &controlledProducer{}
+	plugin := newTestPlugin(t, func([]string, *sarama.Config) (sarama.SyncProducer, error) {
+		close(started)
+		<-release
+		return producer, nil
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := plugin.WriteContext(ctx, testutil.MockMetrics())
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, time.Since(start), 500*time.Millisecond)
+	close(release)
+	require.Eventually(t, func() bool {
+		plugin.producerMu.Lock()
+		defer plugin.producerMu.Unlock()
+		return plugin.producer == producer
+	}, time.Second, time.Millisecond)
+	require.NoError(t, plugin.Close())
+}
+
+func TestProducerCreationIsShared(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	producer := &controlledProducer{}
+	var creations atomic.Int32
+	plugin := newTestPlugin(t, func([]string, *sarama.Config) (sarama.SyncProducer, error) {
+		if creations.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return producer, nil
+	})
+
+	results := make(chan error, 4)
+	for range 3 {
+		go func() {
+			ctx, cancel := context.WithTimeout(t.Context(), 40*time.Millisecond)
+			defer cancel()
+			results <- plugin.ConnectContext(ctx)
+		}()
+	}
+	<-started
+	for range 3 {
+		require.ErrorIs(t, <-results, context.DeadlineExceeded)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancel()
+	err := plugin.ConnectContext(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, int32(1), creations.Load())
+
+	close(release)
+	require.Eventually(t, func() bool {
+		plugin.producerMu.Lock()
+		defer plugin.producerMu.Unlock()
+		return plugin.producer == producer
+	}, time.Second, time.Millisecond)
+	require.NoError(t, plugin.Close())
+}
+
+func TestRunningOutputRetryConnectionIsBounded(t *testing.T) {
+	blocked := make(chan struct{})
+	var creations atomic.Int32
+	plugin := newTestPlugin(t, func([]string, *sarama.Config) (sarama.SyncProducer, error) {
+		if creations.Add(1) == 1 {
+			return nil, errors.New("initial connection failed")
+		}
+		<-blocked
+		return &controlledProducer{}, nil
+	})
+	running, err := models.NewRunningOutput(plugin, &models.OutputConfig{
+		Name: "kafka", StartupErrorBehavior: "retry",
+	}, 5, 10)
+	require.NoError(t, err)
+	require.NoError(t, running.ConnectContext(t.Context()))
+	running.AddMetric(testutil.TestMetric(1))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = running.WriteContext(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, time.Since(start), 500*time.Millisecond)
+	require.Equal(t, int32(2), creations.Load())
+	close(blocked)
+	require.Eventually(t, func() bool {
+		plugin.producerMu.Lock()
+		defer plugin.producerMu.Unlock()
+		return plugin.producer != nil
+	}, time.Second, time.Millisecond)
+	running.Close()
+}
+
+func TestCloseDuringProducerCreation(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	producer := &controlledProducer{}
+	plugin := newTestPlugin(t, func([]string, *sarama.Config) (sarama.SyncProducer, error) {
+		close(started)
+		<-release
+		return producer, nil
+	})
+	plugin.closeTimeout = 25 * time.Millisecond
+
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := plugin.acquireProducer(t.Context())
+		result <- err
+	}()
+	<-started
+	start := time.Now()
+	require.NoError(t, plugin.Close())
+	require.Less(t, time.Since(start), 500*time.Millisecond)
+
+	close(release)
+	require.ErrorContains(t, <-result, "result is no longer usable")
+	require.Eventually(t, func() bool { return producer.closes.Load() == 1 }, time.Second, time.Millisecond)
+	plugin.producerMu.Lock()
+	require.Nil(t, plugin.producer)
+	require.True(t, plugin.closed)
+	plugin.producerMu.Unlock()
+}
+
+func TestSharedProducerCreationSucceeds(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	producer := &controlledProducer{}
+	var creations atomic.Int32
+	plugin := newTestPlugin(t, func([]string, *sarama.Config) (sarama.SyncProducer, error) {
+		if creations.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return producer, nil
+	})
+
+	type acquisition struct {
+		producer   sarama.SyncProducer
+		generation uint64
+		err        error
+	}
+	results := make(chan acquisition, 2)
+	for range 2 {
+		go func() {
+			p, generation, err := plugin.acquireProducer(t.Context())
+			results <- acquisition{p, generation, err}
+		}()
+	}
+	<-started
+	close(release)
+	first, second := <-results, <-results
+	require.NoError(t, first.err)
+	require.NoError(t, second.err)
+	require.Same(t, producer, first.producer)
+	require.Same(t, producer, second.producer)
+	require.Equal(t, first.generation, second.generation)
+	require.Equal(t, int32(1), creations.Load())
+	require.NoError(t, plugin.Close())
+}
+
+func TestProducerCreationFailureCanRetry(t *testing.T) {
+	creationErr := errors.New("creation failed")
+	producer := &controlledProducer{}
+	var creations atomic.Int32
+	plugin := newTestPlugin(t, func([]string, *sarama.Config) (sarama.SyncProducer, error) {
+		if creations.Add(1) == 1 {
+			return nil, creationErr
+		}
+		return producer, nil
+	})
+
+	_, _, err := plugin.acquireProducer(t.Context())
+	require.ErrorIs(t, err, creationErr)
+	require.Equal(t, int32(1), creations.Load())
+
+	p, _, err := plugin.acquireProducer(t.Context())
+	require.NoError(t, err)
+	require.Same(t, producer, p)
+	require.Equal(t, int32(2), creations.Load())
+	require.NoError(t, plugin.Close())
+}
+
+func TestClose(t *testing.T) {
+	tests := []struct {
+		name     string
+		closeErr error
+	}{
+		{name: "success"},
+		{name: "producer error", closeErr: sarama.ErrNotConnected},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			producer := &controlledProducer{closeErr: tt.closeErr}
+			plugin := newTestPlugin(t, func([]string, *sarama.Config) (sarama.SyncProducer, error) {
+				return producer, nil
+			})
+			require.NoError(t, plugin.Connect())
+			err := plugin.Close()
+			if tt.closeErr == nil {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, tt.closeErr)
+			}
+			require.Equal(t, int32(1), producer.closes.Load())
+		})
+	}
+}
+
+func TestCloseDoesNotWaitForProducer(t *testing.T) {
+	closeBlock := make(chan struct{})
+	producer := &controlledProducer{closeBlock: closeBlock}
+	plugin := newTestPlugin(t, func([]string, *sarama.Config) (sarama.SyncProducer, error) {
+		return producer, nil
+	})
+	plugin.closeTimeout = 25 * time.Millisecond
+	require.NoError(t, plugin.Connect())
+
+	start := time.Now()
+	err := plugin.Close()
+	require.ErrorContains(t, err, "timed out")
+	require.Less(t, time.Since(start), 500*time.Millisecond)
+	close(closeBlock)
+}
+
+func TestCloseRacesWithCancelledWrite(t *testing.T) {
+	sendBlock := make(chan struct{})
+	closeBlock := make(chan struct{})
+	producer := &controlledProducer{sendBlock: sendBlock, closeBlock: closeBlock}
+	plugin := newTestPlugin(t, func([]string, *sarama.Config) (sarama.SyncProducer, error) {
+		return producer, nil
+	})
+	plugin.closeTimeout = 25 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(t.Context())
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- plugin.WriteContext(ctx, testutil.MockMetrics()) }()
+	require.Eventually(t, func() bool { return producer.sends.Load() == 1 }, time.Second, time.Millisecond)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- plugin.Close() }()
+	require.Eventually(t, func() bool { return producer.closes.Load() == 1 }, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-writeDone, context.Canceled)
+	require.ErrorContains(t, <-closeDone, "timed out")
+	require.Equal(t, int32(1), producer.closes.Load())
+	close(sendBlock)
+	close(closeBlock)
+}
+
+func newTestPlugin(t *testing.T, factory func([]string, *sarama.Config) (sarama.SyncProducer, error)) *Kafka {
+	t.Helper()
+	s := &influx.Serializer{}
+	require.NoError(t, s.Init())
+	plugin := &Kafka{Brokers: []string{"127.0.0.1"}, Topic: "telegraf", Log: testutil.Logger{}, producerFunc: factory}
+	plugin.SetSerializer(s)
+	require.NoError(t, plugin.Init())
+	return plugin
+}
+
+type controlledProducer struct {
+	sarama.SyncProducer
+	sendBlock  <-chan struct{}
+	closeBlock <-chan struct{}
+	sendErr    error
+	closeErr   error
+	sends      atomic.Int32
+	closes     atomic.Int32
+}
+
+func (p *controlledProducer) SendMessages([]*sarama.ProducerMessage) error {
+	p.sends.Add(1)
+	if p.sendBlock != nil {
+		<-p.sendBlock
+	}
+	return p.sendErr
+}
+
+func (p *controlledProducer) Close() error {
+	p.closes.Add(1)
+	if p.closeBlock != nil {
+		<-p.closeBlock
+	}
+	return p.closeErr
 }
 
 type mockProducer struct {

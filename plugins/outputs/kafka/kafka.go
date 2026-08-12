@@ -3,11 +3,13 @@ package kafka
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -26,6 +28,13 @@ var sampleConfig string
 
 var zeroTime = time.Unix(0, 0)
 
+// Allow one replacement attempt while cleanup of the original producer is
+// stuck, but do not accumulate producers indefinitely on repeated timeouts.
+const (
+	maxPoisonedProducers = 2
+	defaultCloseTimeout  = 5 * time.Second
+)
+
 type Kafka struct {
 	Brokers           []string          `toml:"brokers"`
 	Topic             string            `toml:"topic"`
@@ -43,10 +52,24 @@ type Kafka struct {
 
 	saramaConfig *sarama.Config
 	producerFunc func(addrs []string, config *sarama.Config) (sarama.SyncProducer, error)
+	producerMu   sync.Mutex
 	producer     sarama.SyncProducer
+	producerGen  uint64
+	attempt      *producerAttempt
+	poisoned     int
+	limitLogged  bool
+	closed       bool
+	closeTimeout time.Duration
 	headerTmpl   map[string]*template.Template
 
 	serializer telegraf.Serializer
+}
+
+type producerAttempt struct {
+	done       chan struct{}
+	producer   sarama.SyncProducer
+	generation uint64
+	err        error
 }
 
 type TopicSuffix struct {
@@ -121,22 +144,152 @@ func (k *Kafka) Init() error {
 }
 
 func (k *Kafka) Connect() error {
-	producer, err := k.producerFunc(k.Brokers, k.saramaConfig)
-	if err != nil {
-		return &internal.StartupError{Err: err, Retry: true}
-	}
-	k.producer = producer
-	return nil
+	return k.ConnectContext(context.Background())
+}
+
+func (k *Kafka) ConnectContext(ctx context.Context) error {
+	_, _, err := k.acquireProducer(ctx)
+	return err
 }
 
 func (k *Kafka) Close() error {
-	if k.producer == nil {
+	k.producerMu.Lock()
+	k.closed = true
+	producer := k.producer
+	k.producer = nil
+	k.producerMu.Unlock()
+	if producer == nil {
 		return nil
 	}
-	return k.producer.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- producer.Close()
+	}()
+	timeout := k.producerCloseTimeout()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("closing Kafka producer timed out after %s", timeout)
+	}
 }
 
+func (k *Kafka) acquireProducer(ctx context.Context) (sarama.SyncProducer, uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+
+	k.producerMu.Lock()
+	if k.closed {
+		k.producerMu.Unlock()
+		return nil, 0, errors.New("kafka output is closed")
+	}
+	if k.producer != nil {
+		producer, generation := k.producer, k.producerGen
+		k.producerMu.Unlock()
+		return producer, generation, nil
+	}
+	if k.poisoned >= maxPoisonedProducers {
+		if !k.limitLogged {
+			k.Log.Errorf("Kafka producer replacement limit reached; refusing to create another producer because previous producers are still shutting down")
+			k.limitLogged = true
+		}
+		k.producerMu.Unlock()
+		return nil, 0, errors.New("kafka producer replacement limit reached while previous producers are still shutting down")
+	}
+
+	attempt := k.attempt
+	startAttempt := false
+	if attempt == nil {
+		attempt = &producerAttempt{done: make(chan struct{})}
+		k.attempt = attempt
+		startAttempt = true
+	}
+	k.producerMu.Unlock()
+	if startAttempt {
+		go k.createProducer(attempt)
+	}
+
+	select {
+	case <-attempt.done:
+		if attempt.err != nil && ctx.Err() != nil {
+			return nil, 0, ctx.Err()
+		}
+		return attempt.producer, attempt.generation, attempt.err
+	case <-ctx.Done():
+		return nil, 0, ctx.Err()
+	}
+}
+
+func (k *Kafka) createProducer(attempt *producerAttempt) {
+	producer, err := k.producerFunc(k.Brokers, k.saramaConfig)
+
+	k.producerMu.Lock()
+	install := err == nil && !k.closed && k.attempt == attempt && k.producer == nil
+	if install {
+		k.producer = producer
+		k.producerGen++
+		attempt.producer = producer
+		attempt.generation = k.producerGen
+	} else if err != nil {
+		attempt.err = &internal.StartupError{Err: err, Retry: true}
+	} else {
+		attempt.err = errors.New("kafka producer creation result is no longer usable")
+	}
+	if k.attempt == attempt {
+		k.attempt = nil
+	}
+	close(attempt.done)
+	k.producerMu.Unlock()
+
+	if producer != nil && !install {
+		k.disposeProducer(producer)
+	}
+}
+
+func (k *Kafka) disposeProducer(producer sarama.SyncProducer) {
+	done := make(chan error, 1)
+	go func() {
+		done <- producer.Close()
+	}()
+	timer := time.NewTimer(k.producerCloseTimeout())
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			k.Log.Errorf("Error closing unused Kafka producer: %v", err)
+		}
+	case <-timer.C:
+		k.Log.Errorf("Timed out closing unused Kafka producer; abandoning it")
+	}
+}
+
+func (k *Kafka) producerCloseTimeout() time.Duration {
+	if k.closeTimeout > 0 {
+		return k.closeTimeout
+	}
+	return defaultCloseTimeout
+}
+
+// Write writes the metrics to Kafka. It ignores context cancellation.
 func (k *Kafka) Write(metrics []telegraf.Metric) error {
+	return k.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes the metrics to Kafka. It can be cancelled via the context.
+func (k *Kafka) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	producer, generation, err := k.acquireProducer(ctx)
+	if err != nil {
+		return err
+	}
+
 	msgs := make([]*sarama.ProducerMessage, 0, len(metrics))
 	for _, metric := range metrics {
 		metric, topic := k.getTopicName(metric)
@@ -184,10 +337,29 @@ func (k *Kafka) Write(metrics []telegraf.Metric) error {
 		msgs = append(msgs, m)
 	}
 
-	if err := k.producer.SendMessages(msgs); err != nil {
+	done := make(chan error, 1)
+	go func() {
+		done <- producer.SendMessages(msgs)
+	}()
+
+	var sendErr error
+	select {
+	case <-ctx.Done():
+		// Prefer a result that became available concurrently with cancellation.
+		select {
+		case sendErr = <-done:
+		default:
+			k.poisonProducer(producer, generation, done)
+			return ctx.Err()
+		}
+	case err := <-done:
+		sendErr = err
+	}
+
+	if sendErr != nil {
 		// We could have many errors, return only the first encountered.
 		var errs sarama.ProducerErrors
-		if errors.As(err, &errs) && len(errs) > 0 {
+		if errors.As(sendErr, &errs) && len(errs) > 0 {
 			// Just return the first error encountered
 			firstErr := errs[0]
 			if errors.Is(firstErr.Err, sarama.ErrMessageSizeTooLarge) {
@@ -203,10 +375,39 @@ func (k *Kafka) Write(metrics []telegraf.Metric) error {
 			}
 			return firstErr
 		}
-		return err
+		return sendErr
 	}
 
 	return nil
+}
+
+// poisonProducer detaches a producer whose delivery state is unknown. Cleanup
+// is best-effort because Sarama's graceful Close can itself wait indefinitely.
+func (k *Kafka) poisonProducer(producer sarama.SyncProducer, generation uint64, sendDone <-chan error) {
+	k.producerMu.Lock()
+	if k.producerGen != generation || k.producer == nil {
+		k.producerMu.Unlock()
+		return
+	}
+	k.producer = nil
+	k.poisoned++
+	k.producerMu.Unlock()
+
+	closeDone := make(chan struct{})
+	go func() {
+		if err := producer.Close(); err != nil {
+			k.Log.Errorf("Error closing cancelled producer: %v", err)
+		}
+		close(closeDone)
+	}()
+	go func() {
+		<-sendDone
+		<-closeDone
+		k.producerMu.Lock()
+		k.poisoned--
+		k.limitLogged = false
+		k.producerMu.Unlock()
+	}()
 }
 
 func (k *Kafka) getTopicName(metric telegraf.Metric) (telegraf.Metric, string) {

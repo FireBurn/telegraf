@@ -42,6 +42,23 @@ to use them.
 
 [SECRETSTORE]: ../../../docs/CONFIGURATION.md#secret-store-secrets
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. The
+configured timeout bounds both producer (re)creation and message delivery, so
+a write can no longer block Telegraf indefinitely when the underlying producer
+gets stuck.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: some or all messages may still reach Kafka. Telegraf keeps the batch
+for retry, so a cancelled write can result in duplicate messages. This also
+applies when a slow (but otherwise healthy) broker exceeds `write_timeout`.
+The producer used by the cancelled write is discarded and closed in the
+background, and the next write creates a new one.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Configuration
 
 ```toml @sample.conf
