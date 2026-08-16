@@ -29,6 +29,38 @@ to use them.
 
 [SECRETSTORE]: ../../../docs/CONFIGURATION.md#secret-store-secrets
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. It
+bounds connecting to the configured remote (`remote`) and writing the
+serialized metrics through rclone's virtual filesystem layer.
+
+A few caveats found during investigation, because this plugin can be
+pointed at any of rclone's many supported backends (local disk, S3, SFTP,
+and more):
+
+* rclone's `vfs` package presents a plain, `os.File`-like handle for
+  reading/writing (`OpenFile`/`Write`/`Close`) with no `context.Context`
+  parameter, even though rclone's lower-level backend operations are
+  context-based internally. There is therefore no context to pass
+  straight through at the actual write call site, so a cancelled write is
+  handled by abandoning the in-progress VFS operation in the background
+  rather than cancelling it outright.
+* By default (`cache_write_back` at its 5s default), the actual remote
+  upload already happens asynchronously after `Write` returns, decoupled
+  from any single write call; `write_timeout` bounds the local,
+  synchronous parts of a write (creating directories, opening/writing to
+  the local cache file), which is where most backends could still block,
+  e.g. a backend needing to fetch an existing remote object before an
+  append.
+* Because it varies by backend how promptly the underlying network call
+  actually unwinds after being abandoned, some backends may leave a
+  partially-written remote object behind if a write is cancelled and the
+  abandoned operation later fails.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Configuration
 
 ```toml @sample.conf

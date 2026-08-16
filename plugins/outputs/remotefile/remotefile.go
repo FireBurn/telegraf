@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"text/template"
 	"time"
 
 	"github.com/dustin/go-humanize"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/fspath"
 	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfscommon"
@@ -49,6 +51,24 @@ type File struct {
 	serializers    map[string]telegraf.Serializer
 	modified       map[string]time.Time
 	encoder        internal.ContentEncoder
+
+	// mu guards serializers and modified. Both are normally only touched
+	// from the single goroutine that calls Write, but WriteContext may
+	// abandon a still-running write on context cancellation (see the
+	// Contract section of docs/specs/tsd-012-output-context-aware-write.md),
+	// so a subsequent Write/WriteContext call's bookkeeping can race with
+	// the abandoned goroutine's bookkeeping without this lock.
+	mu sync.Mutex
+
+	// newFsFunc creates the underlying rclone backend and defaults to
+	// info.NewFs. Overridable in tests to inject a hook that blocks until
+	// signaled, so WriteContext/ConnectContext cancellation can be tested
+	// deterministically without racing a real hang.
+	newFsFunc func(ctx context.Context, name, root string, config configmap.Mapper) (fs.Fs, error)
+	// writeFilesFunc performs the actual (potentially blocking) write of
+	// already-serialized data to the VFS and defaults to f.writeFiles.
+	// Overridable in tests for the same reason as newFsFunc.
+	writeFilesFunc func(root *vfs.VFS, groupBuffer map[string][]byte) error
 }
 
 func (*File) SampleConfig() string {
@@ -119,6 +139,33 @@ func (f *File) Init() error {
 }
 
 func (f *File) Connect() error {
+	return f.ConnectContext(context.Background())
+}
+
+// ConnectContext sets up the remote virtual filesystem. It can be
+// cancelled via ctx.
+//
+// rclone's vfs.New explicitly does not derive cancellation from the ctx
+// passed to it ("The ctx passed in is not used for cancellation" - see
+// vfs.New's doc comment); the context stored inside the VFS/backend
+// instead needs to live for as long as the backend does (used for
+// background polling/writeback), which is why the existing code already
+// derived it from context.Background() rather than any per-call context.
+// Whether a given backend's own dial/auth handshake inside NewFs honours
+// context cancellation promptly varies by backend (rclone supports many:
+// S3, SFTP, local, etc.), so rather than relying on that, the whole setup
+// (NewFs + vfs.New + the connectivity-checking List call) is raced in a
+// goroutine and abandoned on cancellation per the Contract section of
+// docs/specs/tsd-012-output-context-aware-write.md. On abandonment,
+// nothing is installed into f - a background goroutine waits for the
+// setup to finish (or hang forever, in the pathological case) and shuts
+// down any VFS it produced so it isn't leaked; a subsequent Connect/
+// ConnectContext call starts its own independent attempt.
+func (f *File) ConnectContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	remoteRaw, err := f.Remote.Get()
 	if err != nil {
 		return fmt.Errorf("getting remote secret failed: %w", err)
@@ -135,30 +182,63 @@ func (f *File) Connect() error {
 	if err != nil {
 		return fmt.Errorf("cannot find remote type %q: %w", parsed.Name, err)
 	}
+	newFsFunc := f.newFsFunc
+	if newFsFunc == nil {
+		newFsFunc = info.NewFs
+	}
 
-	// Setup the remote virtual filesystem
-	ctx, cancel := context.WithCancel(context.Background())
-	rootfs, err := info.NewFs(ctx, parsed.Name, parsed.Path, fs.ConfigMap(info.Prefix, info.Options, parsed.Name, parsed.Config))
-	if err != nil {
+	type dialResult struct {
+		root *vfs.VFS
+		err  error
+	}
+	done := make(chan dialResult, 1)
+	lifetimeCtx, cancel := context.WithCancel(context.Background())
+	go func() {
+		rootfs, err := newFsFunc(lifetimeCtx, parsed.Name, parsed.Path, fs.ConfigMap(info.Prefix, info.Options, parsed.Name, parsed.Config))
+		if err != nil {
+			done <- dialResult{err: fmt.Errorf("creating remote failed: %w", err)}
+			return
+		}
+		root := vfs.New(lifetimeCtx, rootfs, &f.vfsopts)
+
+		// Force connection to make sure we actually can connect
+		if _, err := root.Fs().List(lifetimeCtx, "/"); err != nil {
+			done <- dialResult{err: err}
+			return
+		}
+		done <- dialResult{root: root}
+	}()
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			cancel()
+			return res.err
+		}
+		f.fscancel = cancel
+		f.root = res.root
+		total, used, free := f.root.Statfs()
+		f.Log.Debugf("Connected to %s with %s total, %s used and %s free!",
+			f.root.Fs().String(),
+			humanize.Bytes(uint64(total)),
+			humanize.Bytes(uint64(used)),
+			humanize.Bytes(uint64(free)),
+		)
+		return nil
+	case <-ctx.Done():
+		// Signal the backend to stop in case it does honour context
+		// cancellation, then let setup unwind in the background without
+		// installing anything into f. Shut down any VFS it eventually
+		// produces so it isn't leaked; a hung backend still leaks the
+		// goroutine itself until the underlying call returns.
 		cancel()
-		return fmt.Errorf("creating remote failed: %w", err)
+		go func() {
+			if res := <-done; res.err == nil && res.root != nil {
+				res.root.Shutdown()
+			}
+		}()
+		return ctx.Err()
 	}
-	f.fscancel = cancel
-	f.root = vfs.New(ctx, rootfs, &f.vfsopts)
-
-	// Force connection to make sure we actually can connect
-	if _, err := f.root.Fs().List(ctx, "/"); err != nil {
-		return err
-	}
-	total, used, free := f.root.Statfs()
-	f.Log.Debugf("Connected to %s with %s total, %s used and %s free!",
-		f.root.Fs().String(),
-		humanize.Bytes(uint64(total)),
-		humanize.Bytes(uint64(used)),
-		humanize.Bytes(uint64(free)),
-	)
-
-	return nil
 }
 
 func (f *File) Close() error {
@@ -182,6 +262,43 @@ func (f *File) Close() error {
 }
 
 func (f *File) Write(metrics []telegraf.Metric) error {
+	return f.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext serializes the metrics and writes them to the configured
+// remote via the VFS. It can be cancelled via ctx.
+//
+// vfs.Handle (returned by VFS.OpenFile) implements the plain os.File-like
+// OsFiler interface - Write/Close take no context, so there is no native
+// passthrough at this call site even though rclone's lower-level fs.Fs/
+// fs.Object operations do accept one; the VFS layer intentionally hides
+// that (its default async write-back, cache_write_back, already decouples
+// the actual remote upload from this call in the common case, but
+// OpenFile itself can still block, e.g. fetching an existing remote
+// object's metadata/content for append mode, or MkdirAll for backends
+// without real directories). Per the Contract section of
+// docs/specs/tsd-012-output-context-aware-write.md, the actual VFS/remote
+// work is therefore raced in a goroutine and abandoned on cancellation.
+// f.mu guards the plugin's own bookkeeping (serializers, modified) so an
+// abandoned write's bookkeeping can't race a later call's; f.root itself
+// is captured into a local before racing so a concurrent Close() setting
+// f.root = nil can't race the read. The underlying vfs.VFS is safe for
+// concurrent access by design (it backs FUSE mounts, which see concurrent
+// syscalls from many processes), so Close() running concurrently with an
+// abandoned write is expected to be handled gracefully by the library.
+//
+// Caveat found during investigation: because rclone fans out to many
+// different backend types (S3, SFTP, local, etc.), how promptly an
+// individual backend's own network calls actually unblock after
+// cancellation - as opposed to how promptly WriteContext returns to its
+// caller, which is always prompt - varies by configured backend, and some
+// backends may leave a partially-written remote object behind after an
+// abandoned write eventually completes or fails.
+func (f *File) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	var buf bytes.Buffer
 
 	// Group the metrics per output file
@@ -205,10 +322,12 @@ func (f *File) Write(metrics []telegraf.Metric) error {
 
 	// Serialize the metric groups
 	groupBuffer := make(map[string][]byte, len(groups))
+	f.mu.Lock()
 	for fn, fnMetrics := range groups {
 		if _, found := f.serializers[fn]; !found {
 			var err error
 			if f.serializers[fn], err = f.serializerFunc(); err != nil {
+				f.mu.Unlock()
 				return fmt.Errorf("creating serializer failed: %w", err)
 			}
 		}
@@ -242,8 +361,40 @@ func (f *File) Write(metrics []telegraf.Metric) error {
 			}
 		}
 	}
+	f.mu.Unlock()
 
-	// Write the files
+	writeFilesFunc := f.writeFilesFunc
+	if writeFilesFunc == nil {
+		writeFilesFunc = f.writeFiles
+	}
+
+	done := make(chan error, 1)
+	root := f.root
+	go func() {
+		done <- writeFilesFunc(root, groupBuffer)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		// Let the write finish (or hang forever, in the pathological
+		// case) in the background rather than waiting for it; log the
+		// eventual outcome instead of dropping it silently.
+		go func() {
+			if err := <-done; err != nil {
+				f.Log.Errorf("Write to remote abandoned after context cancellation eventually failed: %v", err)
+			}
+		}()
+		return ctx.Err()
+	}
+}
+
+// writeFiles writes the already-serialized per-file buffers to the given
+// VFS root, and records what it wrote in f.modified/f.serializers (both
+// guarded by f.mu since this may run as an abandoned goroutine racing a
+// later call, see WriteContext).
+func (f *File) writeFiles(root *vfs.VFS, groupBuffer map[string][]byte) error {
 	t := time.Now()
 	for fn, serialized := range groupBuffer {
 		// Make sure the directory exists
@@ -253,13 +404,13 @@ func (f *File) Write(metrics []telegraf.Metric) error {
 			if filepath.ToSlash(fn) != fn {
 				dir = filepath.FromSlash(dir)
 			}
-			if err := f.root.MkdirAll(dir, os.FileMode(f.root.Opt.DirPerms)); err != nil {
+			if err := root.MkdirAll(dir, os.FileMode(root.Opt.DirPerms)); err != nil {
 				return fmt.Errorf("creating dir %q failed: %w", dir, err)
 			}
 		}
 
 		// Open the file for appending or create a new one
-		file, err := f.root.OpenFile(fn, os.O_APPEND|os.O_RDWR|os.O_CREATE, os.FileMode(f.root.Opt.FilePerms))
+		file, err := root.OpenFile(fn, os.O_APPEND|os.O_RDWR|os.O_CREATE, os.FileMode(root.Opt.FilePerms))
 		if err != nil {
 			return fmt.Errorf("opening file %q: %w", fn, err)
 		}
@@ -271,17 +422,21 @@ func (f *File) Write(metrics []telegraf.Metric) error {
 		}
 		file.Close()
 
+		f.mu.Lock()
 		f.modified[fn] = t
+		f.mu.Unlock()
 	}
 
 	// Cleanup internal structures for old files
 	if f.ForgetFiles > 0 {
+		f.mu.Lock()
 		for fn, tmod := range f.modified {
 			if t.Sub(tmod) > time.Duration(f.ForgetFiles) {
 				delete(f.serializers, fn)
 				delete(f.modified, fn)
 			}
 		}
+		f.mu.Unlock()
 	}
 
 	return nil

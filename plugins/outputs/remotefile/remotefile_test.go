@@ -1,6 +1,8 @@
 package remotefile
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/vfs"
 	"github.com/stretchr/testify/require"
 
 	"github.com/influxdata/telegraf"
@@ -562,4 +567,92 @@ func TestTrackingMetrics(t *testing.T) {
 		defer mu.Unlock()
 		return len(input) == len(delivered)
 	}, time.Second, 100*time.Millisecond, "%d delivered but %d expected", len(delivered), len(expected))
+}
+
+// TestWriteContextCancellation asserts that WriteContext returns promptly
+// once its context is cancelled, without waiting for the underlying VFS
+// write to finish. writeFilesFunc is overridden with a hook that blocks
+// until signaled instead of racing a real hang, per the Contract section
+// of docs/specs/tsd-012-output-context-aware-write.md.
+func TestWriteContextCancellation(t *testing.T) {
+	plugin := &File{
+		Remote:           config.NewSecret([]byte("local:" + t.TempDir())),
+		Files:            []string{"test"},
+		CompressionLevel: -1,
+		Log:              &testutil.Logger{},
+	}
+	plugin.SetSerializerFunc(func() (telegraf.Serializer, error) {
+		serializer := &influx.Serializer{}
+		err := serializer.Init()
+		return serializer, err
+	})
+	require.NoError(t, plugin.Init())
+
+	unblock := make(chan struct{})
+	plugin.writeFilesFunc = func(_ *vfs.VFS, _ map[string][]byte) error {
+		<-unblock
+		return nil
+	}
+	defer close(unblock)
+
+	input := []telegraf.Metric{
+		metric.New(
+			"test",
+			map[string]string{"source": "localhost"},
+			map[string]interface{}{"value": 42},
+			time.Unix(1719410485, 0),
+		),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- plugin.WriteContext(ctx, input)
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
+}
+
+// TestConnectContextCancellation asserts that ConnectContext returns
+// promptly once its context is cancelled, without waiting for the
+// underlying backend dial to finish. newFsFunc is overridden with a hook
+// that blocks until signaled instead of racing a real hang, per the
+// Contract section of docs/specs/tsd-012-output-context-aware-write.md.
+func TestConnectContextCancellation(t *testing.T) {
+	plugin := &File{
+		Remote:           config.NewSecret([]byte("local:" + t.TempDir())),
+		Files:            []string{"test"},
+		CompressionLevel: -1,
+		Log:              &testutil.Logger{},
+	}
+	require.NoError(t, plugin.Init())
+
+	unblock := make(chan struct{})
+	plugin.newFsFunc = func(_ context.Context, _, _ string, _ configmap.Mapper) (fs.Fs, error) {
+		<-unblock
+		return nil, errors.New("simulated dial aborted")
+	}
+	defer close(unblock)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- plugin.ConnectContext(ctx)
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ConnectContext did not return after context cancellation")
+	}
 }
