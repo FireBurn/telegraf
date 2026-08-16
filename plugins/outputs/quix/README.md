@@ -55,3 +55,21 @@ Furthermore, the `workspace` parameter must be set to the `Workspace ID` or the
 under the `General settings` section.
 
 [token]: https://quix.io/docs/develop/authentication/personal-access-token.html
+
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. The
+configured timeout bounds both producer (re)creation -- including the HTTP
+call to fetch the broker configuration from the Quix API and the subsequent
+Kafka producer dial -- and message delivery, so a write can no longer block
+Telegraf indefinitely when either step gets stuck.
+
+When a write is cancelled, the delivery outcome of the in-flight message is
+unknown: it may or may not have reached the broker. Telegraf keeps the batch
+for retry, so a cancelled write can result in duplicate messages. This also
+applies when a slow (but otherwise healthy) broker exceeds `write_timeout`.
+The producer used by the cancelled write is discarded and closed in the
+background, and the next write creates a new one.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
