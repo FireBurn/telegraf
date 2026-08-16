@@ -145,6 +145,10 @@ func (o *OpenTelemetry) Close() error {
 }
 
 func (o *OpenTelemetry) Write(metrics []telegraf.Metric) error {
+	return o.WriteContext(context.Background(), metrics)
+}
+
+func (o *OpenTelemetry) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	metricBatch := make(map[int64][]telegraf.Metric)
 	timestamps := make([]int64, 0, len(metrics))
 	for _, metric := range metrics {
@@ -162,7 +166,10 @@ func (o *OpenTelemetry) Write(metrics []telegraf.Metric) error {
 
 	o.Log.Debugf("Received %d metrics and split into %d groups by timestamp", len(metrics), len(metricBatch))
 	for _, timestamp := range timestamps {
-		if err := o.sendBatch(metricBatch[timestamp]); err != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := o.sendBatch(ctx, metricBatch[timestamp]); err != nil {
 			return err
 		}
 	}
@@ -170,7 +177,7 @@ func (o *OpenTelemetry) Write(metrics []telegraf.Metric) error {
 	return nil
 }
 
-func (o *OpenTelemetry) sendBatch(metrics []telegraf.Metric) error {
+func (o *OpenTelemetry) sendBatch(ctx context.Context, metrics []telegraf.Metric) error {
 	batch := o.metricsConverter.NewBatch()
 	for _, metric := range metrics {
 		var vType common.InfluxMetricValueType
@@ -209,7 +216,7 @@ func (o *OpenTelemetry) sendBatch(metrics []telegraf.Metric) error {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(o.Timeout))
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(o.Timeout))
 	defer cancel()
 
 	headers := maps.Clone(o.Headers)

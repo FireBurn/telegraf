@@ -377,3 +377,56 @@ func (m *mockOtelService) Export(ctx context.Context, request pmetricotlp.Export
 	require.True(m.t, ok)
 	return pmetricotlp.NewExportResponse(), nil
 }
+
+type blockingOtelClient struct {
+	entered chan struct{}
+}
+
+func (*blockingOtelClient) Connect(*clientConfig) error { return nil }
+
+func (*blockingOtelClient) Close() error { return nil }
+
+func (b *blockingOtelClient) Export(ctx context.Context, _ pmetricotlp.ExportRequest) (pmetricotlp.ExportResponse, error) {
+	close(b.entered)
+	<-ctx.Done()
+	return pmetricotlp.NewExportResponse(), ctx.Err()
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	metricsConverter, err := influx2otel.NewLineProtocolToOtelMetrics(&otelLogger{testutil.Logger{}})
+	require.NoError(t, err)
+
+	client := &blockingOtelClient{entered: make(chan struct{})}
+	plugin := &OpenTelemetry{
+		Log:              testutil.Logger{},
+		Timeout:          config.Duration(time.Minute),
+		metricsConverter: metricsConverter,
+		otlpMetricClient: client,
+	}
+
+	m := metric.New(
+		"test",
+		map[string]string{},
+		map[string]interface{}{"value": 42.0},
+		time.Now(),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() { done <- plugin.WriteContext(ctx, []telegraf.Metric{m}) }()
+
+	select {
+	case <-client.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Export was never called")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return promptly after context cancellation")
+	}
+}
