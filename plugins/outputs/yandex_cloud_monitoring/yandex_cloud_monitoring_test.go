@@ -1,6 +1,7 @@
 package yandex_cloud_monitoring
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -142,5 +143,98 @@ func TestWrite(t *testing.T) {
 
 			require.NoError(t, err)
 		})
+	}
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	testMetadataHTTPServer := httptest.NewServer(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/token") {
+				token := MetadataIamToken{
+					AccessToken: "token1",
+					ExpiresIn:   123,
+				}
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				require.NoError(t, json.NewEncoder(w).Encode(token))
+			} else if strings.HasSuffix(r.URL.Path, "/folder") {
+				_, err := io.WriteString(w, "folder1")
+				require.NoError(t, err)
+			}
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+	defer testMetadataHTTPServer.Close()
+	metadataTokenURL := "http://" + testMetadataHTTPServer.Listener.Addr().String() + "/token"
+	metadataFolderURL := "http://" + testMetadataHTTPServer.Listener.Addr().String() + "/folder"
+
+	unblock := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	defer close(unblock)
+
+	plugin := &YandexCloudMonitoring{
+		Log:               testutil.Logger{},
+		EndpointURL:       "http://" + ts.Listener.Addr().String() + "/metrics",
+		MetadataTokenURL:  metadataTokenURL,
+		MetadataFolderURL: metadataFolderURL,
+	}
+	require.NoError(t, plugin.Connect())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- plugin.WriteContext(ctx, []telegraf.Metric{
+			metric.New(
+				"cluster",
+				map[string]string{},
+				map[string]interface{}{"cpu": 42.0},
+				time.Unix(0, 0),
+			),
+		})
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
+}
+
+func TestConnectContextCancellation(t *testing.T) {
+	unblock := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	defer close(unblock)
+
+	folderURL := "http://" + ts.Listener.Addr().String() + "/folder"
+
+	plugin := &YandexCloudMonitoring{
+		Log:               testutil.Logger{},
+		MetadataFolderURL: folderURL,
+		MetadataTokenURL:  folderURL,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- plugin.ConnectContext(ctx)
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ConnectContext did not return after context cancellation")
 	}
 }

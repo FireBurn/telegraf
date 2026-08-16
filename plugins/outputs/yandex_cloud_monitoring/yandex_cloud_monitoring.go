@@ -3,6 +3,7 @@ package yandex_cloud_monitoring
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -76,6 +77,12 @@ func (*YandexCloudMonitoring) SampleConfig() string {
 
 // Connect initializes the plugin and validates connectivity
 func (a *YandexCloudMonitoring) Connect() error {
+	return a.ConnectContext(context.Background())
+}
+
+// ConnectContext initializes the plugin and validates connectivity, returning
+// promptly when ctx is cancelled
+func (a *YandexCloudMonitoring) ConnectContext(ctx context.Context) error {
 	if a.Timeout <= 0 {
 		a.Timeout = config.Duration(defaultRequestTimeout)
 	}
@@ -100,7 +107,7 @@ func (a *YandexCloudMonitoring) Connect() error {
 	}
 
 	var err error
-	a.FolderID, err = a.getFolderIDFromMetadata()
+	a.FolderID, err = a.getFolderIDFromMetadata(ctx)
 	if err != nil {
 		return err
 	}
@@ -121,6 +128,12 @@ func (a *YandexCloudMonitoring) Close() error {
 
 // Write writes metrics to the remote endpoint
 func (a *YandexCloudMonitoring) Write(metrics []telegraf.Metric) error {
+	return a.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes metrics to the remote endpoint, returning promptly
+// when ctx is cancelled
+func (a *YandexCloudMonitoring) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	var yandexCloudMonitoringMetrics []yandexCloudMonitoringMetric
 	for _, m := range metrics {
 		for _, field := range m.FieldList() {
@@ -153,11 +166,11 @@ func (a *YandexCloudMonitoring) Write(metrics []telegraf.Metric) error {
 		return err
 	}
 	body = append(jsonBytes, '\n')
-	return a.send(body)
+	return a.send(ctx, body)
 }
 
-func getResponseFromMetadata(c *http.Client, metadataURL string) ([]byte, error) {
-	req, err := http.NewRequest("GET", metadataURL, nil)
+func getResponseFromMetadata(ctx context.Context, c *http.Client, metadataURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", metadataURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
@@ -179,9 +192,9 @@ func getResponseFromMetadata(c *http.Client, metadataURL string) ([]byte, error)
 	return body, nil
 }
 
-func (a *YandexCloudMonitoring) getFolderIDFromMetadata() (string, error) {
+func (a *YandexCloudMonitoring) getFolderIDFromMetadata(ctx context.Context) (string, error) {
 	a.Log.Infof("Getting folder ID in %s", a.MetadataFolderURL)
-	body, err := getResponseFromMetadata(a.client, a.MetadataFolderURL)
+	body, err := getResponseFromMetadata(ctx, a.client, a.MetadataFolderURL)
 	if err != nil {
 		return "", err
 	}
@@ -192,9 +205,9 @@ func (a *YandexCloudMonitoring) getFolderIDFromMetadata() (string, error) {
 	return folderID, nil
 }
 
-func (a *YandexCloudMonitoring) getIAMTokenFromMetadata() (string, int, error) {
+func (a *YandexCloudMonitoring) getIAMTokenFromMetadata(ctx context.Context) (string, int, error) {
 	a.Log.Debugf("Getting new IAM token in %s", a.MetadataTokenURL)
-	body, err := getResponseFromMetadata(a.client, a.MetadataTokenURL)
+	body, err := getResponseFromMetadata(ctx, a.client, a.MetadataTokenURL)
 	if err != nil {
 		return "", 0, err
 	}
@@ -208,8 +221,8 @@ func (a *YandexCloudMonitoring) getIAMTokenFromMetadata() (string, int, error) {
 	return metadata.AccessToken, int(metadata.ExpiresIn), nil
 }
 
-func (a *YandexCloudMonitoring) send(body []byte) error {
-	req, err := http.NewRequest("POST", a.EndpointURL, bytes.NewBuffer(body))
+func (a *YandexCloudMonitoring) send(ctx context.Context, body []byte) error {
+	req, err := http.NewRequestWithContext(ctx, "POST", a.EndpointURL, bytes.NewBuffer(body))
 	if err != nil {
 		return err
 	}
@@ -221,7 +234,7 @@ func (a *YandexCloudMonitoring) send(body []byte) error {
 	req.Header.Set("Content-Type", "application/json")
 	isTokenExpired := !a.IamTokenExpirationTime.After(time.Now())
 	if a.IAMToken == "" || isTokenExpired {
-		token, expiresIn, err := a.getIAMTokenFromMetadata()
+		token, expiresIn, err := a.getIAMTokenFromMetadata(ctx)
 		if err != nil {
 			return err
 		}

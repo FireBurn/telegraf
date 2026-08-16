@@ -39,3 +39,20 @@ When plugin is working inside a YC.Compute instance it will take IAM token and
 Folder ID from instance metadata.
 
 Other authentication methods will be added later.
+
+## Write timeout support
+
+This plugin implements the optional context-aware output interfaces and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds the outbound HTTP request(s) made during a write or
+connect attempt: the metrics POST to the monitoring endpoint, and any
+metadata-service requests needed to fetch the folder ID (on connect) or a
+fresh IAM token (on connect, and again during a write whenever the current
+token has expired).
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: the destination may or may not have received the metrics. Telegraf
+keeps the batch for retry, so a cancelled write can result in duplicate
+metrics.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
