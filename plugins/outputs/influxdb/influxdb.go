@@ -99,7 +99,12 @@ func (i *InfluxDB) Init() error {
 }
 
 func (i *InfluxDB) Connect() error {
-	ctx := context.Background()
+	return i.ConnectContext(context.Background())
+}
+
+// ConnectContext connects to the configured InfluxDB servers, passing the
+// context through to any blocking setup calls (e.g. database creation).
+func (i *InfluxDB) ConnectContext(ctx context.Context) error {
 	i.clients = make([]Client, 0, len(i.URLs))
 
 	for _, u := range i.URLs {
@@ -189,8 +194,12 @@ func (i *InfluxDB) Close() error {
 // Write sends metrics to one of the configured servers, logging each
 // unsuccessful. If all servers fail, return an error.
 func (i *InfluxDB) Write(metrics []telegraf.Metric) error {
-	ctx := context.Background()
+	return i.WriteContext(context.Background(), metrics)
+}
 
+// WriteContext sends metrics to one of the configured servers, passing ctx
+// through to the underlying client so a write can be cancelled/bounded.
+func (i *InfluxDB) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	allErrorsAreDatabaseNotFoundErrors := true
 	var err error
 	p := rand.Perm(len(i.clients))

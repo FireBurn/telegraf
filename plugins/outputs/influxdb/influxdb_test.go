@@ -26,6 +26,9 @@ type MockClient struct {
 	DatabaseF       func() string
 	CloseF          func()
 
+	lastWriteCtx          context.Context
+	lastCreateDatabaseCtx context.Context
+
 	log telegraf.Logger
 }
 
@@ -33,11 +36,13 @@ func (c *MockClient) URL() string {
 	return c.URLF()
 }
 
-func (c *MockClient) Write(context.Context, []telegraf.Metric) error {
+func (c *MockClient) Write(ctx context.Context, _ []telegraf.Metric) error {
+	c.lastWriteCtx = ctx
 	return c.WriteF()
 }
 
-func (c *MockClient) CreateDatabase(context.Context, string) error {
+func (c *MockClient) CreateDatabase(ctx context.Context, _ string) error {
+	c.lastCreateDatabaseCtx = ctx
 	return c.CreateDatabaseF()
 }
 
@@ -230,6 +235,80 @@ func TestWriteRecreateDatabaseIfDatabaseNotFound(t *testing.T) {
 
 	// We only have one URL, so we expect an error
 	require.Error(t, output.Write(metrics))
+}
+
+func TestWriteContextPropagatesContext(t *testing.T) {
+	client := MockClient{
+		DatabaseF:       func() string { return "telegraf" },
+		CreateDatabaseF: func() error { return nil },
+		WriteF:          func() error { return nil },
+		URLF:            func() string { return "http://localhost:8086" },
+	}
+
+	output := influxdb.InfluxDB{
+		URLs: []string{"http://localhost:8086"},
+		CreateHTTPClientF: func(*influxdb.HTTPConfig) (influxdb.Client, error) {
+			return &client, nil
+		},
+		Log:        testutil.Logger{},
+		Statistics: selfstat.NewCollector(nil),
+	}
+	defer output.Statistics.UnregisterAll()
+
+	require.NoError(t, output.Init())
+
+	type ctxKey struct{}
+	connectCtx := context.WithValue(context.Background(), ctxKey{}, "connect")
+	require.NoError(t, output.ConnectContext(connectCtx))
+	defer output.Close()
+	require.Equal(t, "connect", client.lastCreateDatabaseCtx.Value(ctxKey{}))
+
+	m := metric.New("cpu", map[string]string{}, map[string]interface{}{"value": 42.0}, time.Unix(0, 0))
+
+	writeCtx := context.WithValue(context.Background(), ctxKey{}, "write")
+	require.NoError(t, output.WriteContext(writeCtx, []telegraf.Metric{m}))
+	require.Equal(t, "write", client.lastWriteCtx.Value(ctxKey{}))
+}
+
+func TestWriteContextReturnsPromptlyOnCancellation(t *testing.T) {
+	unblock := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-unblock:
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	defer close(unblock)
+
+	output := influxdb.InfluxDB{
+		URLs:                 []string{server.URL},
+		Timeout:              config.Duration(time.Minute),
+		SkipDatabaseCreation: true,
+		CreateHTTPClientF: func(cfg *influxdb.HTTPConfig) (influxdb.Client, error) {
+			return influxdb.NewHTTPClient(*cfg)
+		},
+		Log:        testutil.Logger{},
+		Statistics: selfstat.NewCollector(nil),
+	}
+	defer output.Statistics.UnregisterAll()
+
+	require.NoError(t, output.Init())
+	require.NoError(t, output.Connect())
+	defer output.Close()
+
+	m := metric.New("cpu", map[string]string{}, map[string]interface{}{"value": 42.0}, time.Unix(0, 0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := output.WriteContext(ctx, []telegraf.Metric{m})
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	require.Less(t, elapsed, 5*time.Second)
 }
 
 func TestInfluxDBLocalAddress(t *testing.T) {
