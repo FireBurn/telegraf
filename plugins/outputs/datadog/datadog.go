@@ -3,6 +3,7 @@ package datadog
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -137,6 +138,10 @@ func (d *Datadog) convertToDatadogMetric(metrics []telegraf.Metric) []*Metric {
 }
 
 func (d *Datadog) Write(metrics []telegraf.Metric) error {
+	return d.WriteContext(context.Background(), metrics)
+}
+
+func (d *Datadog) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	ts := TimeSeries{}
 	tempSeries := d.convertToDatadogMetric(metrics)
 
@@ -164,7 +169,7 @@ func (d *Datadog) Write(metrics []telegraf.Metric) error {
 		if err != nil {
 			return err
 		}
-		req, err = http.NewRequest("POST", d.authenticatedURL(), bytes.NewBuffer(buf))
+		req, err = http.NewRequestWithContext(ctx, "POST", d.authenticatedURL(), bytes.NewBuffer(buf))
 		if err != nil {
 			return err
 		}
@@ -172,7 +177,7 @@ func (d *Datadog) Write(metrics []telegraf.Metric) error {
 	case "none":
 		fallthrough
 	default:
-		req, err = http.NewRequest("POST", d.authenticatedURL(), bytes.NewBuffer(tsBytes))
+		req, err = http.NewRequestWithContext(ctx, "POST", d.authenticatedURL(), bytes.NewBuffer(tsBytes))
 	}
 
 	if err != nil {
