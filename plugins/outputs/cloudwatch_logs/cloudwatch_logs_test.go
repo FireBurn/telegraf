@@ -85,6 +85,98 @@ func (c *mockCloudWatchLogs) PutLogEvents(
 // Ensure mockCloudWatchLogs implement cloudWatchLogs interface
 var _ cloudWatchLogs = (*mockCloudWatchLogs)(nil)
 
+// blockingCloudWatchLogs blocks in DescribeLogStreams (the first API call
+// made for a log stream with no sequence token yet) until its context is
+// cancelled or release is closed, used to verify WriteContext returns
+// promptly on cancellation.
+type blockingCloudWatchLogs struct {
+	release chan struct{}
+	reached chan struct{}
+}
+
+func (*blockingCloudWatchLogs) DescribeLogGroups(
+	context.Context,
+	*cloudwatchlogs.DescribeLogGroupsInput,
+	...func(options *cloudwatchlogs.Options),
+) (*cloudwatchlogs.DescribeLogGroupsOutput, error) {
+	return nil, nil
+}
+
+func (b *blockingCloudWatchLogs) DescribeLogStreams(
+	ctx context.Context,
+	_ *cloudwatchlogs.DescribeLogStreamsInput,
+	_ ...func(options *cloudwatchlogs.Options),
+) (*cloudwatchlogs.DescribeLogStreamsOutput, error) {
+	b.reached <- struct{}{}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-b.release:
+		return &cloudwatchlogs.DescribeLogStreamsOutput{}, nil
+	}
+}
+
+func (*blockingCloudWatchLogs) CreateLogStream(
+	context.Context,
+	*cloudwatchlogs.CreateLogStreamInput,
+	...func(options *cloudwatchlogs.Options),
+) (*cloudwatchlogs.CreateLogStreamOutput, error) {
+	return nil, nil
+}
+
+func (*blockingCloudWatchLogs) PutLogEvents(
+	context.Context,
+	*cloudwatchlogs.PutLogEventsInput,
+	...func(options *cloudwatchlogs.Options),
+) (*cloudwatchlogs.PutLogEventsOutput, error) {
+	return nil, nil
+}
+
+var _ cloudWatchLogs = (*blockingCloudWatchLogs)(nil)
+
+func TestWriteContextCancellation(t *testing.T) {
+	mock := &blockingCloudWatchLogs{release: make(chan struct{}), reached: make(chan struct{}, 1)}
+	defer close(mock.release)
+
+	plugin := &CloudWatchLogs{
+		LogGroup:     "TestLogGroup",
+		LogStream:    "tag:source",
+		LDMetricName: "docker_log",
+		LDSource:     "field:message",
+		Log:          testutil.Logger{},
+	}
+	require.NoError(t, plugin.Init())
+	plugin.lg = &types.LogGroup{}
+	plugin.lsKey = "tag"
+	plugin.lsSource = "source"
+	plugin.ls = make(map[string]*logStreamContainer)
+	plugin.svc = mock
+
+	m := metric.New(
+		"docker_log",
+		map[string]string{"source": "deadbeef"},
+		map[string]interface{}{"message": "hello"},
+		time.Now(),
+	)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() { result <- plugin.WriteContext(ctx, []telegraf.Metric{m}) }()
+
+	select {
+	case <-mock.reached:
+	case <-time.After(time.Second):
+		t.Fatal("DescribeLogStreams was not called")
+	}
+	cancel()
+
+	select {
+	case <-result:
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
+}
+
 func RandStringBytes(n int) string {
 	const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	b := make([]byte, n)

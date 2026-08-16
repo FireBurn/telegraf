@@ -139,6 +139,12 @@ func (c *CloudWatchLogs) Init() error {
 
 // Connect connects plugin with to receiver of metrics
 func (c *CloudWatchLogs) Connect() error {
+	return c.ConnectContext(context.Background())
+}
+
+// ConnectContext connects to CloudWatch Logs, passing ctx through to client
+// setup and the log group lookup so a stuck connection attempt can be cancelled.
+func (c *CloudWatchLogs) ConnectContext(ctx context.Context) error {
 	var queryToken *string
 	var dummyToken = "dummy"
 	var logGroupsOutput = &cloudwatchlogs.DescribeLogGroupsOutput{NextToken: &dummyToken}
@@ -149,7 +155,7 @@ func (c *CloudWatchLogs) Connect() error {
 		return awsErr
 	}
 
-	cfg, err := config.LoadDefaultConfig(context.TODO())
+	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		return err
 	}
@@ -168,7 +174,7 @@ func (c *CloudWatchLogs) Connect() error {
 	if c.lg == nil { // In case connection is not retried, first time
 		for logGroupsOutput.NextToken != nil {
 			logGroupsOutput, err = c.svc.DescribeLogGroups(
-				context.Background(),
+				ctx,
 				&cloudwatchlogs.DescribeLogGroupsInput{
 					LogGroupNamePrefix: &c.LogGroup,
 					NextToken:          queryToken})
@@ -218,6 +224,12 @@ func (*CloudWatchLogs) Close() error {
 
 // Write perform metrics write to receiver of metrics
 func (c *CloudWatchLogs) Write(metrics []telegraf.Metric) error {
+	return c.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes the metrics to CloudWatch Logs, passing ctx through to
+// the underlying API calls so a stuck write can be cancelled.
+func (c *CloudWatchLogs) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	minTime := time.Now()
 	if c.lg.RetentionInDays != nil {
 		minTime = minTime.Add(-time.Hour * 24 * time.Duration(*c.lg.RetentionInDays))
@@ -347,11 +359,11 @@ func (c *CloudWatchLogs) Write(metrics []telegraf.Metric) error {
 			if elem.sequenceToken == "" {
 				// This is the first attempt to write to log stream,
 				// need to check log stream existence and create it if necessary
-				describeLogStreamOutput, err := c.svc.DescribeLogStreams(context.Background(), &cloudwatchlogs.DescribeLogStreamsInput{
+				describeLogStreamOutput, err := c.svc.DescribeLogStreams(ctx, &cloudwatchlogs.DescribeLogStreamsInput{
 					LogGroupName:        &c.LogGroup,
 					LogStreamNamePrefix: &logStream})
 				if err == nil && len(describeLogStreamOutput.LogStreams) == 0 {
-					_, err := c.svc.CreateLogStream(context.Background(), &cloudwatchlogs.CreateLogStreamInput{
+					_, err := c.svc.CreateLogStream(ctx, &cloudwatchlogs.CreateLogStreamInput{
 						LogGroupName:  &c.LogGroup,
 						LogStreamName: &logStream})
 					if err != nil {
@@ -381,7 +393,7 @@ func (c *CloudWatchLogs) Write(metrics []telegraf.Metric) error {
 
 			// There is a quota of 5 requests per second per log stream. Additional
 			// requests are throttled. This quota can't be changed.
-			putLogEventsOutput, err := c.svc.PutLogEvents(context.Background(), &putLogEvents)
+			putLogEventsOutput, err := c.svc.PutLogEvents(ctx, &putLogEvents)
 			if err != nil {
 				c.Log.Errorf("Can't push logs batch to AWS. Reason: %v", err)
 				continue
