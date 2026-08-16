@@ -76,6 +76,10 @@ func (h *HTTP) SetSerializer(serializer telegraf.Serializer) {
 }
 
 func (h *HTTP) Connect() error {
+	return h.ConnectContext(context.Background())
+}
+
+func (h *HTTP) ConnectContext(ctx context.Context) error {
 	if h.AwsService != "" {
 		cfg, err := h.CredentialConfig.Credentials()
 		if err == nil {
@@ -91,7 +95,6 @@ func (h *HTTP) Connect() error {
 		return fmt.Errorf("invalid method [%s] %s", h.URL, h.Method)
 	}
 
-	ctx := context.Background()
 	client, err := h.HTTPClientConfig.CreateClient(ctx, h.Log)
 	if err != nil {
 		return err
@@ -111,13 +114,17 @@ func (h *HTTP) Close() error {
 }
 
 func (h *HTTP) Write(metrics []telegraf.Metric) error {
+	return h.WriteContext(context.Background(), metrics)
+}
+
+func (h *HTTP) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if h.UseBatchFormat {
 		reqBody, err := h.serializer.SerializeBatch(metrics)
 		if err != nil {
 			return err
 		}
 
-		return h.writeMetric(reqBody)
+		return h.writeMetric(ctx, reqBody)
 	}
 
 	for _, metric := range metrics {
@@ -126,14 +133,14 @@ func (h *HTTP) Write(metrics []telegraf.Metric) error {
 			return err
 		}
 
-		if err := h.writeMetric(reqBody); err != nil {
+		if err := h.writeMetric(ctx, reqBody); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (h *HTTP) writeMetric(reqBody []byte) error {
+func (h *HTTP) writeMetric(ctx context.Context, reqBody []byte) error {
 	var reqBodyBuffer io.Reader = bytes.NewBuffer(reqBody)
 
 	var err error
@@ -160,14 +167,13 @@ func (h *HTTP) writeMetric(reqBody []byte) error {
 		payloadHash = &hash
 	}
 
-	req, err := http.NewRequest(h.Method, h.URL, reqBodyBuffer)
+	req, err := http.NewRequestWithContext(ctx, h.Method, h.URL, reqBodyBuffer)
 	if err != nil {
 		return err
 	}
 
 	if h.awsCfg != nil {
 		signer := aws_signer.NewSigner()
-		ctx := context.Background()
 
 		credentials, err := h.awsCfg.Credentials.Retrieve(ctx)
 		if err != nil {
@@ -197,7 +203,7 @@ func (h *HTTP) writeMetric(reqBody []byte) error {
 
 	// google api auth
 	if h.CredentialsFile != "" {
-		token, err := h.getAccessToken(context.Background(), h.URL)
+		token, err := h.getAccessToken(ctx, h.URL)
 		if err != nil {
 			return err
 		}

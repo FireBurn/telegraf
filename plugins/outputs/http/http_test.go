@@ -2,6 +2,7 @@ package http
 
 import (
 	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -129,6 +130,43 @@ func TestMethod(t *testing.T) {
 			err = tt.plugin.Write([]telegraf.Metric{getMetric()})
 			require.NoError(t, err)
 		})
+	}
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	unblock := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	defer close(unblock)
+
+	u, err := url.Parse("http://" + ts.Listener.Addr().String())
+	require.NoError(t, err)
+
+	plugin := &HTTP{
+		URL:    u.String(),
+		Method: defaultMethod,
+	}
+	serializer := &influx.Serializer{}
+	require.NoError(t, serializer.Init())
+	plugin.SetSerializer(serializer)
+	require.NoError(t, plugin.Connect())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- plugin.WriteContext(ctx, []telegraf.Metric{getMetric()})
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
 	}
 }
 
