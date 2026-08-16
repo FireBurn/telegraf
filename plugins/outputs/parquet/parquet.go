@@ -85,6 +85,10 @@ func (p *Parquet) Close() error {
 	return nil
 }
 
+// Write does not implement OutputWithContext/OutputWithConnectContext (see
+// docs/specs/tsd-012-output-context-aware-write.md): it only writes local
+// parquet files via Arrow's local writer, with no outbound network call for
+// a write_timeout deadline to usefully bound.
 func (p *Parquet) Write(metrics []telegraf.Metric) error {
 	groupedMetrics := make(map[string][]telegraf.Metric)
 	for _, metric := range metrics {

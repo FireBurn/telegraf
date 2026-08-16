@@ -64,6 +64,13 @@ func (a *ApplicationInsights) Connect() error {
 	return nil
 }
 
+// Write does not implement OutputWithContext/OutputWithConnectContext (see
+// docs/specs/tsd-012-output-context-aware-write.md): a.transmitter.Track
+// only enqueues telemetry into the SDK's background harvester and returns
+// immediately, so Write never blocks on the network and there is nothing
+// for a write_timeout deadline to bound. The SDK's async delivery, not this
+// call, is where a stuck send could occur; that risk lives in Close's own
+// bounded transmitter.Close() wait, which is unaffected by this spec.
 func (a *ApplicationInsights) Write(metrics []telegraf.Metric) error {
 	for _, metric := range metrics {
 		allMetricTelemetry := a.createTelemetry(metric)

@@ -19,6 +19,11 @@ func (*Discard) SampleConfig() string {
 
 func (*Discard) Connect() error { return nil }
 func (*Discard) Close() error   { return nil }
+
+// Write is a no-op: this plugin does not implement
+// OutputWithContext/OutputWithConnectContext (see
+// docs/specs/tsd-012-output-context-aware-write.md) because there is no
+// outbound call of any kind to bound with a write_timeout deadline.
 func (*Discard) Write([]telegraf.Metric) error {
 	return nil
 }

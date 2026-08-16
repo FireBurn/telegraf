@@ -93,6 +93,10 @@ func (f *File) Close() error {
 	return err
 }
 
+// Write does not implement OutputWithContext/OutputWithConnectContext (see
+// docs/specs/tsd-012-output-context-aware-write.md): it only writes to a
+// local file (or stdout/stderr), with no outbound network call for a
+// write_timeout deadline to usefully bound.
 func (f *File) Write(metrics []telegraf.Metric) error {
 	var writeErr error
 

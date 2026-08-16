@@ -309,6 +309,12 @@ func (p *PrometheusClient) Close() error {
 	return err
 }
 
+// Write does not implement OutputWithContext/OutputWithConnectContext (see
+// docs/specs/tsd-012-output-context-aware-write.md): it only buffers metrics
+// into an in-memory collector for the next pull-based scrape and makes no
+// outbound call, so there is nothing for a write_timeout deadline to bound.
+// Connect only starts a local HTTP listener for scrapers to poll, which is
+// the same reasoning already applied to outputs.health.
 func (p *PrometheusClient) Write(metrics []telegraf.Metric) error {
 	return p.collector.Add(metrics)
 }
