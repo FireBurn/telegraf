@@ -35,6 +35,20 @@ to use them.
 
 [SECRETSTORE]: ../../../docs/CONFIGURATION.md#secret-store-secrets
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds client creation during connect and the
+`CreateTimeSeries` calls made during a write.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: Stackdriver may or may not have recorded some or all of the time
+series. Telegraf keeps the batch for retry, so a cancelled write can result
+in duplicate points.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Configuration
 
 ```toml @sample.conf

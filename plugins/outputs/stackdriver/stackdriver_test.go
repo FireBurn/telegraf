@@ -1185,6 +1185,40 @@ func TestSecretTokenSource(t *testing.T) {
 	require.Equal(t, "Bearer", token.TokenType)
 }
 
+func TestWriteContextCancellation(t *testing.T) {
+	server := &mockServer{
+		resps: []proto.Message{&emptypb.Empty{}},
+		block: make(chan struct{}),
+	}
+	srv, client := startServer(t, server)
+	defer srv.GracefulStop()
+	defer close(server.block)
+
+	plugin := &Stackdriver{
+		Project:   "projects/[PROJECT]",
+		Namespace: "test",
+		Log:       testutil.Logger{},
+		client:    client,
+	}
+	require.NoError(t, plugin.Init())
+	require.NoError(t, plugin.Connect())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- plugin.WriteContext(ctx, testutil.MockMetrics())
+	}()
+
+	cancel()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
+}
+
 func startServer(t *testing.T, mock *mockServer) (*grpc.Server, *monitoring.MetricClient) {
 	t.Helper()
 
@@ -1220,9 +1254,21 @@ type mockServer struct {
 
 	// responses to return if err == nil
 	resps []proto.Message
+
+	// If set, CreateTimeSeries blocks on this channel (or ctx cancellation)
+	// before responding.
+	block chan struct{}
 }
 
 func (s *mockServer) CreateTimeSeries(ctx context.Context, req *monitoringpb.CreateTimeSeriesRequest) (*emptypb.Empty, error) {
+	if s.block != nil {
+		select {
+		case <-s.block:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
 	md, _ := metadata.FromIncomingContext(ctx)
 	if xg := md["x-goog-api-client"]; len(xg) == 0 || !strings.Contains(xg[0], "gl-go/") {
 		return nil, fmt.Errorf("x-goog-api-client = %v, expected gl-go key", xg)

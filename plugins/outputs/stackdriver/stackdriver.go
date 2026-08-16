@@ -118,6 +118,10 @@ func (*Stackdriver) SampleConfig() string {
 
 // Connect initiates the primary connection to the GCP project.
 func (s *Stackdriver) Connect() error {
+	return s.ConnectContext(context.Background())
+}
+
+func (s *Stackdriver) ConnectContext(ctx context.Context) error {
 	if s.Project == "" {
 		return errors.New("project is a required field for stackdriver output")
 	}
@@ -141,8 +145,6 @@ func (s *Stackdriver) Connect() error {
 	s.ResourceLabels["project_id"] = s.Project
 
 	if s.client == nil {
-		ctx := context.Background()
-
 		options := []option.ClientOption{
 			option.WithUserAgent(internal.ProductToken()),
 			option.WithQuotaProject(s.QuotaProject),
@@ -201,6 +203,10 @@ func (tsb timeSeriesBuckets) Add(m telegraf.Metric, f []*telegraf.Field, ts *mon
 }
 
 func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
+	return s.WriteContext(context.Background(), metrics)
+}
+
+func (s *Stackdriver) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	metricBatch := make(map[int64][]telegraf.Metric)
 	timestamps := make([]int64, 0, len(metrics))
 	for _, metric := range sorted(metrics) {
@@ -219,7 +225,7 @@ func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
 	s.Log.Debugf("received %d metrics", len(metrics))
 	s.Log.Debugf("split into %d groups by timestamp", len(metricBatch))
 	for _, timestamp := range timestamps {
-		if err := s.sendBatch(metricBatch[timestamp]); err != nil {
+		if err := s.sendBatch(ctx, metricBatch[timestamp]); err != nil {
 			return err
 		}
 	}
@@ -228,9 +234,7 @@ func (s *Stackdriver) Write(metrics []telegraf.Metric) error {
 }
 
 // Write the metrics to Google Cloud Stackdriver.
-func (s *Stackdriver) sendBatch(batch []telegraf.Metric) error {
-	ctx := context.Background()
-
+func (s *Stackdriver) sendBatch(ctx context.Context, batch []telegraf.Metric) error {
 	buckets := make(timeSeriesBuckets)
 	for _, m := range batch {
 		// Set metric types based on user-provided filter
