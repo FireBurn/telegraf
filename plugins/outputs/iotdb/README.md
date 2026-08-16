@@ -148,3 +148,46 @@ to use them.
   ## Keep this section commented if you don't want to sanitize the path
   # sanitize_tag = "1.3"
 ```
+
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option, with
+important caveats specific to this plugin.
+
+The underlying Apache IoTDB client is a raw Thrift-generated `Session` with
+no context support anywhere in its call path and no internal locking: it is
+only safe for one goroutine to use a given session at a time. This is
+different from `outputs.kafka` and `outputs.nsq`, whose client libraries are
+documented as safe to close concurrently with an in-flight call. For IoTDB,
+closing a session while a call is still in flight on it risks interleaving
+two unsynchronized requests on the same Thrift transport, which can corrupt
+the wire framing for both or race on the session's unguarded fields.
+
+Because of this, when `write_timeout` fires:
+
+- The connection attempt or write is abandoned and `write_timeout`/
+  `ConnectContext`/`WriteContext` return promptly, as with any other
+  context-aware output.
+- The abandoned session is **not** closed at that point. It is handed off to
+  the still-running goroutine, which closes it once the original call
+  itself eventually returns -- successfully, with an error, or (in the
+  worst case) never, if the IoTDB server is completely unresponsive and
+  never resets the TCP connection. In that worst case the abandoned
+  session's goroutine and connection are never reclaimed.
+- The number of concurrently abandoned sessions is capped (2, matching
+  `outputs.kafka`'s producer-replacement limit) so repeated timeouts fail
+  fast with an explicit error instead of accumulating unboundedly, but this
+  bounds the *count* of leaked sessions, not the *time* any one of them
+  stays open.
+- As with the other context-aware outputs, the delivery outcome of a
+  cancelled write is unknown -- Telegraf keeps the batch for retry, so a
+  cancelled write can result in duplicate inserts.
+
+In short: `write_timeout` reliably bounds how long Telegraf itself waits on
+a stuck IoTDB session, and a new session is created for the next write, but
+it cannot guarantee the old session's resources are ever forcibly reclaimed
+the way it can for outputs backed by libraries with internally
+synchronized, concurrency-safe close semantics.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
