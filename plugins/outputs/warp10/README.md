@@ -70,3 +70,17 @@ string types directly.  Unsigned integer fields will be capped to the largest
 Timestamps are sent in microsecond precision.
 
 [Geo Time Series]: https://www.warp10.io/content/03_Documentation/03_Interacting_with_Warp_10/03_Ingesting_data/02_GTS_input_format
+
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds the single outbound HTTP request made during a
+write.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: the destination may or may not have received the metrics. Telegraf
+keeps the batch for retry, so a cancelled write can result in duplicate
+metrics.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins

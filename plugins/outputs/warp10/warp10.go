@@ -3,6 +3,7 @@ package warp10
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -115,13 +116,18 @@ func (w *Warp10) GenWarp10Payload(metrics []telegraf.Metric) string {
 
 // Write metrics to Warp10
 func (w *Warp10) Write(metrics []telegraf.Metric) error {
+	return w.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext metrics to Warp10, returning promptly when ctx is cancelled
+func (w *Warp10) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	payload := w.GenWarp10Payload(metrics)
 	if payload == "" {
 		return nil
 	}
 
 	addr := w.WarpURL + "/api/v0/update"
-	req, err := http.NewRequest("POST", addr, bytes.NewBufferString(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", addr, bytes.NewBufferString(payload))
 	if err != nil {
 		return fmt.Errorf("unable to create new request %q: %w", addr, err)
 	}
