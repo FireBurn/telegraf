@@ -499,6 +499,38 @@ func TestSignalFx_SignalFx(t *testing.T) {
 	}
 }
 
+type blockingSink struct{}
+
+func (blockingSink) AddDatapoints(ctx context.Context, _ []*datapoint.Datapoint) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (blockingSink) AddEvents(context.Context, []*event.Event) error {
+	return nil
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	plugin := NewSignalFx()
+	plugin.client = blockingSink{}
+	plugin.Log = testutil.Logger{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- plugin.WriteContext(ctx, testutil.MockMetrics())
+	}()
+
+	cancel()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
+}
+
 func TestSignalFx_Errors(t *testing.T) {
 	type measurement struct {
 		name   string

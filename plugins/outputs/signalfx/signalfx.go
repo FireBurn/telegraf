@@ -163,17 +163,24 @@ func (s *SignalFx) ConvertToSignalFx(metrics []telegraf.Metric) ([]*datapoint.Da
 
 // Write call back for writing metrics
 func (s *SignalFx) Write(metrics []telegraf.Metric) error {
+	// s.ctx is cancelled on Close, so a plain Write still stops in that case.
+	return s.WriteContext(s.ctx, metrics)
+}
+
+// WriteContext writes metrics, honoring ctx cancellation/deadline for the
+// underlying AddDatapoints/AddEvents calls.
+func (s *SignalFx) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	dps, events := s.ConvertToSignalFx(metrics)
 
 	if len(dps) > 0 {
-		err := s.client.AddDatapoints(s.ctx, dps)
+		err := s.client.AddDatapoints(ctx, dps)
 		if err != nil {
 			return err
 		}
 	}
 
 	if len(events) > 0 {
-		if err := s.client.AddEvents(s.ctx, events); err != nil {
+		if err := s.client.AddEvents(ctx, events); err != nil {
 			// If events error out but we successfully sent some datapoints,
 			// don't return an error so that it won't ever retry -- that way we
 			// don't send the same datapoints twice.
