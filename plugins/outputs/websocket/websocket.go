@@ -2,6 +2,7 @@
 package websocket
 
 import (
+	"context"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -65,6 +66,19 @@ func (w *WebSocket) Init() error {
 
 // Connect to the output endpoint.
 func (w *WebSocket) Connect() error {
+	return w.ConnectContext(context.Background())
+}
+
+// ConnectContext dials and performs the websocket handshake, aborting early
+// if ctx is cancelled. gorilla/websocket's Dialer.DialContext accepts a
+// context and is passed it directly (it applies ctx.Deadline(), if any, as
+// the connection deadline for the dial and handshake), but it only ever
+// consults ctx.Deadline() once up front -- it does not select on ctx.Done()
+// -- so a plain cancellation with no deadline (e.g. agent shutdown) would
+// not be honored by the library alone. The whole call is therefore also
+// raced in a goroutine and abandoned on cancellation, closing whatever
+// connection it eventually produces instead of installing it.
+func (w *WebSocket) ConnectContext(ctx context.Context) error {
 	tlsCfg, err := w.ClientConfig.TLSConfig()
 	if err != nil {
 		return fmt.Errorf("error creating TLS config: %w", err)
@@ -100,19 +114,38 @@ func (w *WebSocket) Connect() error {
 		secret.Destroy()
 	}
 
-	conn, resp, err := dialer.Dial(w.URL, headers)
-	if err != nil {
-		return fmt.Errorf("error dial: %w", err)
+	type result struct {
+		conn *ws.Conn
+		resp *http.Response
+		err  error
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusSwitchingProtocols {
-		return fmt.Errorf("wrong status code while connecting to server: %d", resp.StatusCode)
+	resultCh := make(chan result, 1)
+	go func() {
+		conn, resp, err := dialer.DialContext(ctx, w.URL, headers)
+		resultCh <- result{conn, resp, err}
+	}()
+
+	select {
+	case res := <-resultCh:
+		if res.err != nil {
+			return fmt.Errorf("error dial: %w", res.err)
+		}
+		_ = res.resp.Body.Close()
+		if res.resp.StatusCode != http.StatusSwitchingProtocols {
+			return fmt.Errorf("wrong status code while connecting to server: %d", res.resp.StatusCode)
+		}
+		w.conn = res.conn
+		go w.read(res.conn)
+		return nil
+	case <-ctx.Done():
+		go func() {
+			res := <-resultCh
+			if res.conn != nil {
+				res.conn.Close()
+			}
+		}()
+		return ctx.Err()
 	}
-
-	w.conn = conn
-	go w.read(conn)
-
-	return nil
 }
 
 func (w *WebSocket) read(conn *ws.Conn) {
@@ -153,9 +186,21 @@ func (w *WebSocket) read(conn *ws.Conn) {
 
 // Write writes the given metrics to the destination. Not thread-safe.
 func (w *WebSocket) Write(metrics []telegraf.Metric) error {
+	return w.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes the given metrics to the destination, aborting an
+// in-flight write via closing the connection when ctx is cancelled.
+// gorilla's Conn.WriteMessage has no native context support, and unlike a
+// raw net.Conn, gorilla only documents Close (and WriteControl) as safe to
+// call concurrently with an in-progress WriteMessage from another
+// goroutine -- calling SetWriteDeadline concurrently races with
+// WriteMessage's internal state -- so cancellation is implemented by
+// closing the connection rather than forcing its deadline.
+func (w *WebSocket) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if w.conn == nil {
 		// Previous write failed with error and ws conn was closed.
-		if err := w.Connect(); err != nil {
+		if err := w.ConnectContext(ctx); err != nil {
 			return err
 		}
 	}
@@ -170,14 +215,32 @@ func (w *WebSocket) Write(metrics []telegraf.Metric) error {
 			return fmt.Errorf("error setting write deadline: %w", err)
 		}
 	}
+
+	// Force the write to abort by closing the connection if ctx is
+	// cancelled. The connection is captured in a local so the watcher never
+	// touches w.conn after it may have been reset by a concurrent caller.
+	conn := w.conn
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-done:
+		}
+	}()
+
 	messageType := ws.BinaryMessage
 	if w.UseTextFrames {
 		messageType = ws.TextMessage
 	}
-	err = w.conn.WriteMessage(messageType, messageData)
+	err = conn.WriteMessage(messageType, messageData)
+	close(done)
 	if err != nil {
-		_ = w.conn.Close()
+		_ = conn.Close()
 		w.conn = nil
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return fmt.Errorf("error writing to connection: %w", err)
 	}
 	return nil

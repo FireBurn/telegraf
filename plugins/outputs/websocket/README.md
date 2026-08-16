@@ -72,3 +72,29 @@ to use them.
   # [outputs.websocket.headers]
   #   Authorization = "Bearer <TOKEN>"
 ```
+
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds a single connect attempt (dialing and completing
+the WebSocket handshake, if not already connected) or a single write attempt
+(sending one serialized batch as a WebSocket message).
+
+> [!NOTE]
+> This plugin already has its own `write_timeout` option (documented above)
+> which sets a fixed per-write socket deadline. Because both options share
+> the same TOML key, setting `write_timeout` on this plugin configures both
+> at once: the fixed socket deadline used for every write, and the
+> context-based deadline used to bound and cancel a stuck write. In
+> practice this means the two mechanisms enforce the same duration.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: the destination may or may not have received the metrics.
+Cancellation is implemented by closing the underlying connection (gorilla's
+`Conn.WriteMessage` only documents `Close` -- not `SetWriteDeadline` -- as
+safe to call concurrently with an in-progress write), so a cancelled write
+always forces a reconnect on the next write. Telegraf keeps the batch for
+retry, so a cancelled write can result in duplicate metrics.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
