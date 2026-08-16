@@ -2,6 +2,7 @@ package graphite
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -767,4 +768,56 @@ func tcpServer2WithTagsSeparatorUnderscore(t *testing.T, wg *sync.WaitGroup) {
 
 	simulateTCPServer(t, wg, tcpServer,
 		"my_prefix_mymeasurement;host=192.168.0.1 3.14 1289430000", "my_prefix_my_measurement;host=192.168.0.1 3.14 1289430000")
+}
+
+// enteredConn signals when a Write has actually reached the connection, so
+// cancellation tests never have to guess the timing with a sleep.
+type enteredConn struct {
+	net.Conn
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (c *enteredConn) Write(b []byte) (int, error) {
+	c.once.Do(func() { close(c.entered) })
+	return c.Conn.Write(b)
+}
+
+func TestWriteContextCancelUnblocksBlockedWrite(t *testing.T) {
+	// net.Pipe is fully synchronous: a Write blocks until the peer Reads,
+	// giving a deterministic (non-timing-dependent) blocked write.
+	client, server := net.Pipe()
+	defer server.Close()
+	blocked := &enteredConn{Conn: client, entered: make(chan struct{})}
+
+	g := &Graphite{Log: testutil.Logger{}}
+	require.NoError(t, g.Init())
+	g.connections = []connection{{name: "blocked", conn: blocked, connected: true}}
+
+	m := metric.New(
+		"cpu",
+		map[string]string{},
+		map[string]interface{}{"value": 3.14},
+		time.Unix(0, 0),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- g.WriteContext(ctx, []telegraf.Metric{m})
+	}()
+
+	// Cancel only once the write has actually reached the blocked connection.
+	<-blocked.entered
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("WriteContext did not return promptly after context cancellation")
+	}
+
+	// The poisoned connection must be dropped so the next write reconnects.
+	require.False(t, g.connections[0].connected)
 }

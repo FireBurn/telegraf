@@ -2,6 +2,7 @@
 package graphite
 
 import (
+	"context"
 	"crypto/tls"
 	_ "embed"
 	"errors"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/internal"
 	common_tls "github.com/influxdata/telegraf/plugins/common/tls"
 	"github.com/influxdata/telegraf/plugins/outputs"
 	"github.com/influxdata/telegraf/plugins/serializers/graphite"
@@ -87,6 +89,12 @@ func (g *Graphite) Init() error {
 }
 
 func (g *Graphite) Connect() error {
+	return g.ConnectContext(context.Background())
+}
+
+// ConnectContext connects to all not-yet-connected servers, aborting any
+// in-flight dial/TLS-handshake when ctx is cancelled.
+func (g *Graphite) ConnectContext(ctx context.Context) error {
 	// Set tls config
 	tlsConfig, err := g.ClientConfig.TLSConfig()
 	if err != nil {
@@ -132,12 +140,24 @@ func (g *Graphite) Connect() error {
 			d.LocalAddr = &net.TCPAddr{IP: local.IP, Port: port, Zone: local.Zone}
 		}
 
-		// Get secure connection if tls config is set
+		// Get secure connection if tls config is set, aborting the dial and
+		// handshake on context cancellation rather than only on d.Timeout.
 		var conn net.Conn
-		if tlsConfig != nil {
-			conn, err = tls.DialWithDialer(&d, "tcp", server.name, tlsConfig)
+		rawConn, dialErr := d.DialContext(ctx, "tcp", server.name)
+		if dialErr != nil {
+			err = dialErr
+		} else if tlsConfig != nil {
+			tlsConn := tls.Client(rawConn, tlsConfig)
+			if hsErr := tlsConn.HandshakeContext(ctx); hsErr != nil {
+				rawConn.Close()
+				err = hsErr
+			} else {
+				err = nil
+				conn = tlsConn
+			}
 		} else {
-			conn, err = d.Dial("tcp", server.name)
+			err = nil
+			conn = rawConn
 		}
 
 		if err == nil {
@@ -211,6 +231,12 @@ func (g *Graphite) checkEOF(conn net.Conn) error {
 }
 
 func (g *Graphite) Write(metrics []telegraf.Metric) error {
+	return g.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes metrics to all connected servers, aborting an
+// in-flight write via a forced deadline when ctx is cancelled.
+func (g *Graphite) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	// Prepare data
 	var batch []byte
 	for _, metric := range metrics {
@@ -222,12 +248,12 @@ func (g *Graphite) Write(metrics []telegraf.Metric) error {
 	}
 
 	// Try to connect to all servers not yet connected if any
-	if err := g.Connect(); err != nil {
+	if err := g.ConnectContext(ctx); err != nil {
 		return fmt.Errorf("failed to reconnect: %w", err)
 	}
 
 	// Return on success of if we encounter a non-retryable error
-	if err := g.send(batch); err == nil || !errors.Is(err, ErrNotConnected) {
+	if err := g.send(ctx, batch); err == nil || !errors.Is(err, ErrNotConnected) {
 		return err
 	}
 
@@ -240,15 +266,15 @@ func (g *Graphite) Write(metrics []telegraf.Metric) error {
 	}
 	if len(failedServers) > 0 {
 		g.Log.Debugf("Reconnecting and retrying for the following servers: %s", strings.Join(failedServers, ","))
-		if err := g.Connect(); err != nil {
+		if err := g.ConnectContext(ctx); err != nil {
 			return fmt.Errorf("failed to reconnect: %w", err)
 		}
 	}
 
-	return g.send(batch)
+	return g.send(ctx, batch)
 }
 
-func (g *Graphite) send(batch []byte) error {
+func (g *Graphite) send(ctx context.Context, batch []byte) error {
 	// Try sending the data to a server. Try them in random order
 	p := rand.Perm(len(g.connections))
 	for i, n := range p {
@@ -274,14 +300,26 @@ func (g *Graphite) send(batch []byte) error {
 			g.connections[n].connected = false
 			continue
 		}
-		_, err := server.conn.Write(batch)
-		if err == nil {
+
+		// Force the write to abort via a deadline if ctx is cancelled;
+		// net.Conn has no native context support.
+		conn := server.conn
+		stop := internal.CancelConnOnContext(ctx, conn)
+		_, err := conn.Write(batch)
+		cancelled := stop()
+		if err == nil && !cancelled {
 			// Sending the data was successfully
 			return nil
 		}
+		if cancelled {
+			// The connection now carries an expired deadline, so it cannot be
+			// reused. Fall through to the teardown below, then report the
+			// cancellation rather than trying the remaining servers.
+			err = ctx.Err()
+		}
 
 		g.Log.Errorf("Writing to %q failed: %v", server.name, err)
-		if i < len(p)-1 {
+		if i < len(p)-1 && !cancelled {
 			g.Log.Info("Trying next server...")
 		}
 		// Mark server as failed so a new connection will be made
@@ -291,6 +329,12 @@ func (g *Graphite) send(batch []byte) error {
 			}
 		}
 		g.connections[n].connected = false
+
+		if cancelled {
+			// The caller has given up on this write; don't spend its budget
+			// re-sending the batch to the remaining servers.
+			return err
+		}
 	}
 
 	// If we end here, none of the writes were successful
