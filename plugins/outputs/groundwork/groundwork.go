@@ -102,11 +102,36 @@ func (g *Groundwork) Init() error {
 }
 
 func (g *Groundwork) Connect() error {
-	err := g.client.Connect()
-	if err != nil {
-		return fmt.Errorf("could not login: %w", err)
+	return g.ConnectContext(context.Background())
+}
+
+// ConnectContext logs in to Groundwork. The underlying SDK's Connect() does
+// not accept a context (it issues its login HTTP request with a
+// hard-coded context.Background(), bounded only by the SDK's own default
+// 40s HTTP client timeout), so it is raced in a goroutine and abandoned on
+// cancellation. The SDK's GWClient guards its token/state with its own
+// internal mutex, so it is safe to let an abandoned login complete in the
+// background: it will either install a token for later use or be
+// superseded by a subsequent Connect call.
+func (g *Groundwork) ConnectContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	return nil
+
+	done := make(chan error, 1)
+	go func() {
+		done <- g.client.Connect()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("could not login: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (g *Groundwork) Close() error {
@@ -118,6 +143,22 @@ func (g *Groundwork) Close() error {
 }
 
 func (g *Groundwork) Write(metrics []telegraf.Metric) error {
+	return g.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext sends the metrics to Groundwork. The SDK's
+// SendResourcesWithMetrics accepts a context.Context natively and threads
+// it all the way down to http.NewRequestWithContext, so cancellation is a
+// plain passthrough here. The one caveat: if the server responds 401
+// mid-request, the SDK transparently re-authenticates by calling the
+// context-less Connect() described in ConnectContext before retrying; that
+// sub-step is not itself cancellable via ctx, but remains bounded by the
+// SDK's own default 40s HTTP client timeout.
+func (g *Groundwork) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	groupMap := make(map[string][]transit.ResourceRef)
 	resourceToServicesMap := make(map[string][]transit.MonitoredService)
 	for _, metric := range metrics {
@@ -186,7 +227,7 @@ func (g *Groundwork) Write(metrics []telegraf.Metric) error {
 		return err
 	}
 
-	_, err = g.client.SendResourcesWithMetrics(context.Background(), requestJSON)
+	_, err = g.client.SendResourcesWithMetrics(ctx, requestJSON)
 	if err != nil {
 		return fmt.Errorf("error while sending: %w", err)
 	}

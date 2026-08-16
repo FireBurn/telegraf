@@ -28,6 +28,24 @@ to use them.
 
 [SECRETSTORE]: ../../../docs/CONFIGURATION.md#secret-store-secrets
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. The
+configured deadline bounds both the login request made during `Connect`
+and the outbound `SendResourcesWithMetrics` request made during `Write`.
+One caveat found during investigation: the underlying GroundWork SDK client
+does not accept a context on its login call, so on cancellation it is raced
+in a goroutine and abandoned rather than cancelled outright; the abandoned
+login is safe to leave running because the SDK client guards its own token
+state with an internal mutex. Separately, if a write request itself gets a
+401 response, the SDK transparently re-authenticates using that same
+context-less login call before retrying, so that particular re-auth
+sub-step is not bounded by `write_timeout`, only by the SDK's own default
+40s HTTP client timeout.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Configuration
 
 ```toml @sample.conf

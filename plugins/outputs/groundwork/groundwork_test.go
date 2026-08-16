@@ -2,12 +2,14 @@ package groundwork
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gwos/tcg/sdk/clients"
 	"github.com/gwos/tcg/sdk/transit"
@@ -398,4 +400,88 @@ func TestWriteWithTags(t *testing.T) {
 	require.NoError(t, err)
 
 	server.Close()
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	metric := testutil.TestMetric(42, "IntMetric")
+
+	unblock := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	defer close(unblock)
+
+	g := Groundwork{
+		Log:            testutil.Logger{},
+		Server:         server.URL,
+		AgentID:        defaultTestAgentID,
+		DefaultHost:    defaultHost,
+		DefaultAppType: defaultAppType,
+		ResourceTag:    "host",
+		client: clients.GWClient{
+			AppName: "telegraf",
+			AppType: defaultAppType,
+			GWConnection: &clients.GWConnection{
+				HostName: server.URL,
+			},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- g.WriteContext(ctx, []telegraf.Metric{metric})
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
+}
+
+func TestConnectContextCancellation(t *testing.T) {
+	unblock := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	defer close(unblock)
+
+	g := Groundwork{
+		Log:            testutil.Logger{},
+		Server:         server.URL,
+		AgentID:        defaultTestAgentID,
+		DefaultHost:    defaultHost,
+		DefaultAppType: defaultAppType,
+		ResourceTag:    "host",
+		client: clients.GWClient{
+			AppName: "telegraf",
+			AppType: defaultAppType,
+			GWConnection: &clients.GWConnection{
+				HostName: server.URL,
+			},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- g.ConnectContext(ctx)
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ConnectContext did not return after context cancellation")
+	}
 }
