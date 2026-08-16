@@ -1,11 +1,17 @@
 package cloudwatch
 
 import (
+	"context"
 	"math"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/stretchr/testify/require"
 
@@ -13,6 +19,45 @@ import (
 	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/testutil"
 )
+
+func TestWriteContextCancellation(t *testing.T) {
+	var reached atomic.Bool
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		reached.Store(true)
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	endpoint := srv.URL
+	svc := cloudwatch.New(cloudwatch.Options{
+		Region:           "us-east-1",
+		Credentials:      credentials.NewStaticCredentialsProvider("id", "secret", ""),
+		BaseEndpoint:     &endpoint,
+		RetryMaxAttempts: 1,
+	})
+
+	c := &CloudWatch{
+		Namespace: "test",
+		Log:       testutil.Logger{},
+		svc:       svc,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() { result <- c.WriteContext(ctx, testutil.MockMetrics()) }()
+
+	require.Eventually(t, reached.Load, time.Second, time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
+}
 
 // Test that each tag becomes one dimension
 func TestBuildDimensions(t *testing.T) {

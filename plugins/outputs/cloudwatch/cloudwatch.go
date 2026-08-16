@@ -71,12 +71,17 @@ func (c *CloudWatch) Init() error {
 }
 
 func (c *CloudWatch) Connect() error {
+	return c.ConnectContext(context.Background())
+}
+
+// ConnectContext connects to CloudWatch, passing ctx through to client setup
+// so a stuck connection attempt can be cancelled.
+func (c *CloudWatch) ConnectContext(ctx context.Context) error {
 	cfg, err := c.CredentialConfig.Credentials()
 	if err != nil {
 		return err
 	}
 
-	ctx := context.Background()
 	client, err := c.HTTPClientConfig.CreateClient(ctx, c.Log)
 	if err != nil {
 		return err
@@ -99,6 +104,12 @@ func (c *CloudWatch) Close() error {
 }
 
 func (c *CloudWatch) Write(metrics []telegraf.Metric) error {
+	return c.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes the metrics to CloudWatch, passing ctx through to
+// PutMetricData so a stuck write can be cancelled.
+func (c *CloudWatch) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	datums := make([]types.MetricDatum, 0, len(metrics))
 	for _, m := range metrics {
 		d := c.buildMetricDatum(m)
@@ -111,7 +122,7 @@ func (c *CloudWatch) Write(metrics []telegraf.Metric) error {
 			Namespace:  aws.String(c.Namespace),
 		}
 
-		if _, err := c.svc.PutMetricData(context.Background(), params); err != nil {
+		if _, err := c.svc.PutMetricData(ctx, params); err != nil {
 			return fmt.Errorf("unable to write to CloudWatch: %w", err)
 		}
 	}
