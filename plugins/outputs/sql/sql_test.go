@@ -2,6 +2,8 @@ package sql
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -144,6 +146,57 @@ var (
 		),
 	}
 )
+
+// TestWriteContextReturnsPromptlyOnCancellation verifies WriteContext
+// actually threads the caller's context down to the database/sql *Context
+// calls, using an in-memory sqlite database (no Docker needed): an
+// already-cancelled context must make the write fail immediately with a
+// context-related error rather than being silently ignored.
+func TestWriteContextReturnsPromptlyOnCancellation(t *testing.T) {
+	plugin := &SQL{
+		Driver:              "sqlite",
+		DataSourceName:      config.NewSecret([]byte(":memory:")),
+		TimestampColumn:     "timestamp",
+		TableTemplate:       "CREATE TABLE {TABLE}({COLUMNS})",
+		TableExistsTemplate: "SELECT 1 FROM {TABLE} LIMIT 1",
+		Convert:             defaultConvert,
+		Log:                 testutil.Logger{},
+		// A single, persistently-idle connection is required so every call
+		// reuses the same connection/in-memory database instead of each
+		// pooled (or freshly reopened) connection getting its own separate
+		// (and initially empty) :memory: database.
+		ConnectionMaxOpen: 1,
+		ConnectionMaxIdle: 1,
+	}
+	require.NoError(t, plugin.Init())
+	require.NoError(t, plugin.Connect())
+	defer plugin.Close()
+
+	m := stableMetric(
+		"cpu",
+		[]telegraf.Tag{},
+		[]telegraf.Field{{Key: "value", Value: 42.0}},
+		time.Unix(0, 0),
+	)
+
+	// Establish the table with a normal write first so the cancellation
+	// check below exercises the insert path, not table creation.
+	require.NoError(t, plugin.Write([]telegraf.Metric{m}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+	err := plugin.WriteContext(ctx, []telegraf.Metric{m})
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	require.True(t, errors.Is(err, context.Canceled), "expected a context.Canceled error, got: %v", err)
+	require.Less(t, elapsed, 5*time.Second)
+
+	// A normal write with a live context still works afterward.
+	require.NoError(t, plugin.Write([]telegraf.Metric{m}))
+}
 
 func TestOracleIntegration(t *testing.T) {
 	if testing.Short() {

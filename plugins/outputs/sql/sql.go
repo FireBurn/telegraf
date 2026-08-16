@@ -3,6 +3,7 @@ package sql
 
 import (
 	"cmp"
+	"context"
 	gosql "database/sql"
 	_ "embed"
 	"fmt"
@@ -115,6 +116,12 @@ func (p *SQL) Init() error {
 }
 
 func (p *SQL) Connect() error {
+	return p.ConnectContext(context.Background())
+}
+
+// ConnectContext opens the database connection and runs any configured
+// init SQL, passing ctx through to the blocking ping/exec calls.
+func (p *SQL) ConnectContext(ctx context.Context) error {
 	dsnBuffer, err := p.DataSourceName.Get()
 	if err != nil {
 		return fmt.Errorf("loading data source name secret failed: %w", err)
@@ -127,7 +134,7 @@ func (p *SQL) Connect() error {
 		return fmt.Errorf("creating database client failed: %w", err)
 	}
 
-	if err := db.Ping(); err != nil {
+	if err := db.PingContext(ctx); err != nil {
 		return fmt.Errorf("pinging database failed: %w", err)
 	}
 
@@ -137,7 +144,7 @@ func (p *SQL) Connect() error {
 	db.SetMaxOpenConns(p.ConnectionMaxOpen)
 
 	if p.InitSQL != "" {
-		if _, err = db.Exec(p.InitSQL); err != nil {
+		if _, err = db.ExecContext(ctx, p.InitSQL); err != nil {
 			return fmt.Errorf("initializing database failed: %w", err)
 		}
 	}
@@ -279,27 +286,27 @@ func (p *SQL) generateInsert(tablename string, columns []string) string {
 		strings.Join(placeholders, ","))
 }
 
-func (p *SQL) createTable(metric telegraf.Metric) error {
+func (p *SQL) createTable(ctx context.Context, metric telegraf.Metric) error {
 	tablename := metric.Name()
 	stmt := p.generateCreateTable(metric)
-	if _, err := p.db.Exec(stmt); err != nil {
+	if _, err := p.db.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("creating table failed: %w", err)
 	}
 	// Ensure compatibility: set the table cache to an empty map
 	p.tables[tablename] = make(map[string]bool)
 	// Modifying the table schema is opt-in
 	if p.TableUpdateTemplate != "" {
-		if err := p.updateTableCache(tablename); err != nil {
+		if err := p.updateTableCache(ctx, tablename); err != nil {
 			return fmt.Errorf("updating table cache failed: %w", err)
 		}
 	}
 	return nil
 }
 
-func (p *SQL) createColumn(tablename, column, columnType string) error {
+func (p *SQL) createColumn(ctx context.Context, tablename, column, columnType string) error {
 	// Ensure table exists in cache before accessing columns
 	if _, tableExists := p.tables[tablename]; !tableExists {
-		if err := p.updateTableCache(tablename); err != nil {
+		if err := p.updateTableCache(ctx, tablename); err != nil {
 			return fmt.Errorf("updating table cache failed: %w", err)
 		}
 	}
@@ -313,20 +320,20 @@ func (p *SQL) createColumn(tablename, column, columnType string) error {
 	}
 	// Generate and execute column addition statement
 	createColumn := p.generateAddColumn(tablename, column, columnType)
-	if _, err := p.db.Exec(createColumn); err != nil {
+	if _, err := p.db.ExecContext(ctx, createColumn); err != nil {
 		return fmt.Errorf("creating column failed: %w", err)
 	}
 	// Update cache after adding the column
-	if err := p.updateTableCache(tablename); err != nil {
+	if err := p.updateTableCache(ctx, tablename); err != nil {
 		return fmt.Errorf("updating table cache failed: %w", err)
 	}
 	return nil
 }
 
-func (p *SQL) tableExists(tableName string) bool {
+func (p *SQL) tableExists(ctx context.Context, tableName string) bool {
 	stmt := strings.ReplaceAll(p.TableExistsTemplate, "{TABLE}", p.quoteIdent(tableName))
 
-	_, err := p.db.Exec(stmt)
+	_, err := p.db.ExecContext(ctx, stmt)
 
 	// Make sure to update the table cache to not query the table existence in
 	// every write cycle
@@ -336,7 +343,7 @@ func (p *SQL) tableExists(tableName string) bool {
 		// If table_update_template is set, populate the column cache now
 		// so we know which columns already exist before trying to add new ones
 		if p.TableUpdateTemplate != "" {
-			if err := p.updateTableCache(tableName); err != nil {
+			if err := p.updateTableCache(ctx, tableName); err != nil {
 				p.Log.Errorf("failed to populate column cache for existing table %s: %v", tableName, err)
 			}
 		}
@@ -345,10 +352,10 @@ func (p *SQL) tableExists(tableName string) bool {
 	return exists
 }
 
-func (p *SQL) updateTableCache(tablename string) error {
+func (p *SQL) updateTableCache(ctx context.Context, tablename string) error {
 	stmt := strings.ReplaceAll(p.tableListColumnsTemplate, "{TABLE}", quoteStr(tablename))
 
-	columns, err := p.db.Query(stmt)
+	columns, err := p.db.QueryContext(ctx, stmt)
 	if err != nil {
 		return fmt.Errorf("fetching columns for table(%s) failed: %w", tablename, err)
 	}
@@ -399,21 +406,21 @@ func (p *SQL) processMetric(metric telegraf.Metric) (string, []string, []interfa
 	return strings.Join(append([]string{metric.Name()}, columns...), "\n"), columns, values
 }
 
-func (p *SQL) sendIndividual(sql string, values []interface{}) error {
+func (p *SQL) sendIndividual(ctx context.Context, sql string, values []interface{}) error {
 	switch p.Driver {
 	case "clickhouse":
 		// ClickHouse needs to batch inserts with prepared statements
-		tx, err := p.db.Begin()
+		tx, err := p.db.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("begin failed: %w", err)
 		}
-		stmt, err := tx.Prepare(sql)
+		stmt, err := tx.PrepareContext(ctx, sql)
 		if err != nil {
 			return fmt.Errorf("prepare failed: %w", err)
 		}
 		defer stmt.Close()
 
-		_, err = stmt.Exec(values...)
+		_, err = stmt.ExecContext(ctx, values...)
 		if err != nil {
 			return fmt.Errorf("execution failed: %w", err)
 		}
@@ -422,7 +429,7 @@ func (p *SQL) sendIndividual(sql string, values []interface{}) error {
 			return fmt.Errorf("commit failed: %w", err)
 		}
 	default:
-		_, err := p.db.Exec(sql, values...)
+		_, err := p.db.ExecContext(ctx, sql, values...)
 		if err != nil {
 			return fmt.Errorf("execution failed: %w", err)
 		}
@@ -431,20 +438,20 @@ func (p *SQL) sendIndividual(sql string, values []interface{}) error {
 	return nil
 }
 
-func (p *SQL) sendBatch(sql string, values [][]interface{}) error {
-	tx, err := p.db.Begin()
+func (p *SQL) sendBatch(ctx context.Context, sql string, values [][]interface{}) error {
+	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin failed: %w", err)
 	}
 
-	batch, err := tx.Prepare(sql)
+	batch, err := tx.PrepareContext(ctx, sql)
 	if err != nil {
 		return fmt.Errorf("prepare failed: %w", err)
 	}
 	defer batch.Close()
 
 	for _, params := range values {
-		if _, err := batch.Exec(params...); err != nil {
+		if _, err := batch.ExecContext(ctx, params...); err != nil {
 			if errRollback := tx.Rollback(); errRollback != nil {
 				return fmt.Errorf("execution failed: %w, unable to rollback: %w", err, errRollback)
 			}
@@ -460,13 +467,19 @@ func (p *SQL) sendBatch(sql string, values [][]interface{}) error {
 }
 
 func (p *SQL) Write(metrics []telegraf.Metric) error {
+	return p.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes metrics to the database, passing ctx through to the
+// underlying *Context calls so a write can be cancelled/bounded.
+func (p *SQL) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	batchedQueries := make(map[string][][]interface{})
 
 	for _, metric := range metrics {
 		tablename := metric.Name()
 		// create table if needed
-		if _, found := p.tables[tablename]; !found && !p.tableExists(tablename) {
-			if err := p.createTable(metric); err != nil {
+		if _, found := p.tables[tablename]; !found && !p.tableExists(ctx, tablename) {
+			if err := p.createTable(ctx, metric); err != nil {
 				return err
 			}
 		}
@@ -479,7 +492,7 @@ func (p *SQL) Write(metrics []telegraf.Metric) error {
 		// Modifying the table schema is opt-in
 		if p.TableUpdateTemplate != "" {
 			for i := range len(columns) {
-				if err := p.createColumn(tablename, columns[i], p.deriveDatatype(values[i])); err != nil {
+				if err := p.createColumn(ctx, tablename, columns[i], p.deriveDatatype(values[i])); err != nil {
 					return err
 				}
 			}
@@ -488,7 +501,7 @@ func (p *SQL) Write(metrics []telegraf.Metric) error {
 		if p.BatchTx {
 			batchedQueries[sql] = append(batchedQueries[sql], values)
 		} else {
-			if err := p.sendIndividual(sql, values); err != nil {
+			if err := p.sendIndividual(ctx, sql, values); err != nil {
 				return err
 			}
 		}
@@ -496,7 +509,7 @@ func (p *SQL) Write(metrics []telegraf.Metric) error {
 
 	if p.BatchTx {
 		for query, queryParams := range batchedQueries {
-			if err := p.sendBatch(query, queryParams); err != nil {
+			if err := p.sendBatch(ctx, query, queryParams); err != nil {
 				return fmt.Errorf("failed to send a batched tx: %w", err)
 			}
 		}
