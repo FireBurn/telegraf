@@ -285,6 +285,29 @@ func newPostgresqlTest(tb testing.TB) (*PostgresqlTest, error) {
 	return pt, nil
 }
 
+// TestConnectContextReturnsPromptlyOnCancellation verifies ConnectContext
+// propagates the caller's context instead of ignoring it: it points at a
+// non-routable address (RFC 5737 TEST-NET-1) with a driver-side
+// connect_timeout far longer than the context deadline, so a passing test
+// proves the context deadline - not the driver's own timeout - is what
+// stopped the call. No Docker container needed.
+func TestConnectContextReturnsPromptlyOnCancellation(t *testing.T) {
+	p := newPostgresql()
+	p.Connection = config.NewSecret([]byte("host=192.0.2.1 port=5432 user=telegraf password=telegraf dbname=telegraf connect_timeout=60"))
+	p.Logger = NewLogAccumulator(t)
+	require.NoError(t, p.Init())
+
+	callCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := p.ConnectContext(callCtx)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	require.Less(t, elapsed, 5*time.Second)
+}
+
 func TestPostgresqlConnectIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")

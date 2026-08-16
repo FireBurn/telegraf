@@ -42,6 +42,23 @@ to use them.
 
 [SECRETSTORE]: ../../../docs/CONFIGURATION.md#secret-store-secrets
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds the connection pool creation/ping on connect, and
+on write it bounds the transaction on the single-connection path or, when
+using a connection pool, only how long a write waits to hand its batch off
+to a pool worker — once accepted, the actual write continues in the
+background rather than being aborted mid-flight by this option.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: the database may or may not have committed some or all of the
+metrics. Telegraf keeps the batch for retry, so a cancelled write can result
+in duplicate metrics.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Configuration
 
 ```toml @sample.conf

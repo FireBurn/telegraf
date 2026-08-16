@@ -155,10 +155,20 @@ func (p *Postgresql) Init() error {
 
 // Connect establishes a connection to the target database and prepares the cache
 func (p *Postgresql) Connect() error {
-	// Yes, we're not supposed to store the context. However since we don't receive a context, we have to.
+	return p.ConnectContext(context.Background())
+}
+
+// ConnectContext establishes a connection to the target database and
+// prepares the cache. The passed ctx bounds the initial pool creation and
+// ping; the pool itself (and the workers/operations that use it afterwards)
+// keep running on a separate, plugin-lifetime context that outlives this
+// call and is only cancelled on Close, since pooled connections and
+// background write workers must not be torn down just because the caller's
+// ctx (e.g. a write_timeout-bounded startup attempt) is later cancelled.
+func (p *Postgresql) ConnectContext(ctx context.Context) error {
 	p.dbContext, p.dbContextCancel = context.WithCancel(context.Background())
 
-	db, err := pgxpool.NewWithConfig(p.dbContext, p.dbConfig)
+	db, err := pgxpool.NewWithConfig(ctx, p.dbConfig)
 	if err != nil {
 		p.dbContextCancel()
 		return &internal.StartupError{
@@ -168,7 +178,7 @@ func (p *Postgresql) Connect() error {
 	}
 
 	// Make sure we are connected
-	if err := db.Ping(p.dbContext); err != nil {
+	if err := db.Ping(ctx); err != nil {
 		db.Close()
 		p.dbContextCancel()
 		return &internal.StartupError{
@@ -239,6 +249,16 @@ func (p *Postgresql) Close() error {
 }
 
 func (p *Postgresql) Write(metrics []telegraf.Metric) error {
+	return p.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes metrics to Postgresql, passing ctx through to the
+// underlying pgx calls on the synchronous (single-connection) path. On the
+// concurrent (pooled) path, ctx only bounds handing the batch off to a
+// write worker: once accepted, the worker keeps running on the pool's own
+// lifetime context so an in-flight async write is not aborted mid-flight
+// just because this particular Write call's ctx was cancelled/timed out.
+func (p *Postgresql) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if p.tagsCache != nil {
 		// gather at the start of write so there's less chance of any async operations ongoing
 		p.Logger.Debugf("cache: size=%d hit=%d miss=%d full=%d\n",
@@ -254,9 +274,9 @@ func (p *Postgresql) Write(metrics []telegraf.Metric) error {
 
 	var err error
 	if p.db.Stat().MaxConns() > 1 {
-		p.writeConcurrent(tableSources)
+		err = p.writeConcurrent(ctx, tableSources)
 	} else {
-		err = p.writeSequential(tableSources)
+		err = p.writeSequential(ctx, tableSources)
 	}
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -271,24 +291,24 @@ func (p *Postgresql) Write(metrics []telegraf.Metric) error {
 	return err
 }
 
-func (p *Postgresql) writeSequential(tableSources map[string]*TableSource) error {
-	tx, err := p.db.Begin(p.dbContext)
+func (p *Postgresql) writeSequential(ctx context.Context, tableSources map[string]*TableSource) error {
+	tx, err := p.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("starting transaction: %w", err)
 	}
-	defer tx.Rollback(p.dbContext) //nolint:errcheck // In case of failure during commit, "err" from commit will be returned
+	defer tx.Rollback(ctx) //nolint:errcheck // In case of failure during commit, "err" from commit will be returned
 
 	for _, tableSource := range tableSources {
 		sp := tx
 		if len(tableSources) > 1 {
 			// wrap each sub-batch in a savepoint so that if a permanent error is received, we can drop just that one sub-batch, and insert everything else.
-			sp, err = tx.Begin(p.dbContext)
+			sp, err = tx.Begin(ctx)
 			if err != nil {
 				return fmt.Errorf("starting savepoint: %w", err)
 			}
 		}
 
-		err := p.writeMetricsFromMeasure(p.dbContext, sp, tableSource)
+		err := p.writeMetricsFromMeasure(ctx, sp, tableSource)
 		if err != nil {
 			if isTempError(err) {
 				// return so that telegraf will retry the whole batch
@@ -299,27 +319,30 @@ func (p *Postgresql) writeSequential(tableSources map[string]*TableSource) error
 				return nil
 			}
 			// drop this one sub-batch and continue trying the rest
-			if err := sp.Rollback(p.dbContext); err != nil {
+			if err := sp.Rollback(ctx); err != nil {
 				return err
 			}
 		}
 		// savepoints do not need to be committed (released), so save the round trip and skip it
 	}
 
-	if err := tx.Commit(p.dbContext); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("committing transaction: %w", err)
 	}
 	return nil
 }
 
-func (p *Postgresql) writeConcurrent(tableSources map[string]*TableSource) {
+func (p *Postgresql) writeConcurrent(ctx context.Context, tableSources map[string]*TableSource) error {
 	for _, tableSource := range tableSources {
 		select {
 		case p.writeChan <- tableSource:
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-p.dbContext.Done():
-			return
+			return p.dbContext.Err()
 		}
 	}
+	return nil
 }
 
 func (p *Postgresql) writeWorker(ctx context.Context) {
