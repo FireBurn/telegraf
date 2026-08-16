@@ -3,6 +3,7 @@ package azure_monitor
 import (
 	"bufio"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -343,6 +344,63 @@ func TestWrite(t *testing.T) {
 			require.Equal(t, tt.expectedCalls, calls.Load())
 			require.Equal(t, tt.expectedMetrics, metrics.Load())
 		})
+	}
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	t.Setenv("AZURE_CLIENT_ID", "fake")
+	t.Setenv("AZURE_USERNAME", "fake")
+	t.Setenv("AZURE_PASSWORD", "fake")
+
+	unblock := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	defer close(unblock)
+
+	plugin := AzureMonitor{
+		EndpointURL:          "http://" + ts.Listener.Addr().String(),
+		Region:               "test",
+		ResourceID:           "/test",
+		TimestampLimitPast:   config.Duration(30 * time.Minute),
+		TimestampLimitFuture: config.Duration(-1 * time.Minute),
+		Log:                  testutil.Logger{},
+		timeFunc:             func() time.Time { return time.Unix(120, 0) },
+	}
+	require.NoError(t, plugin.Init())
+	plugin.preparer = autorest.CreatePreparer(autorest.NullAuthorizer{}.WithAuthorization())
+	require.NoError(t, plugin.Connect())
+	defer plugin.Close()
+
+	metrics := []telegraf.Metric{
+		metric.New(
+			"cpu-value",
+			map[string]string{},
+			map[string]interface{}{
+				"min":   float64(42),
+				"max":   float64(42),
+				"sum":   float64(42),
+				"count": int64(1),
+			},
+			time.Unix(0, 0),
+		),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- plugin.WriteContext(ctx, metrics)
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
 	}
 }
 

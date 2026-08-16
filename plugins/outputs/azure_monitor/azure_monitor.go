@@ -93,6 +93,10 @@ func (a *AzureMonitor) Init() error {
 }
 
 func (a *AzureMonitor) Connect() error {
+	return a.ConnectContext(context.Background())
+}
+
+func (a *AzureMonitor) ConnectContext(ctx context.Context) error {
 	a.client = &http.Client{
 		Transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
@@ -102,7 +106,7 @@ func (a *AzureMonitor) Connect() error {
 
 	// If information is missing try to retrieve it from the Azure VM instance
 	if a.Region == "" || a.ResourceID == "" {
-		region, resourceID, err := vmInstanceMetadata(a.client)
+		region, resourceID, err := vmInstanceMetadata(ctx, a.client)
 		if err != nil {
 			return fmt.Errorf("getting VM metadata failed: %w", err)
 		}
@@ -279,6 +283,11 @@ func (a *AzureMonitor) Reset() {
 
 // Write writes metrics to the remote endpoint
 func (a *AzureMonitor) Write(metrics []telegraf.Metric) error {
+	return a.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes metrics to the remote endpoint, respecting context cancellation.
+func (a *AzureMonitor) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	now := a.timeFunc()
 	tsEarliest := now.Add(-time.Duration(a.TimestampLimitPast))
 	tsLatest := now.Add(time.Duration(a.TimestampLimitFuture))
@@ -344,7 +353,7 @@ func (a *AzureMonitor) Write(metrics []telegraf.Metric) error {
 		// Azure Monitor's maximum request body size of 4MB. Send batches that
 		// exceed this size via separate write requests.
 		if buffer.Len()+len(buf)+1 > maxRequestBodySize {
-			if retryable, err := a.send(buffer.Bytes()); err != nil {
+			if retryable, err := a.send(ctx, buffer.Bytes()); err != nil {
 				writeErr.Err = err
 				if !retryable {
 					writeErr.MetricsReject = append(writeErr.MetricsAccept, batchIndices...)
@@ -363,7 +372,7 @@ func (a *AzureMonitor) Write(metrics []telegraf.Metric) error {
 		}
 	}
 
-	if retryable, err := a.send(buffer.Bytes()); err != nil {
+	if retryable, err := a.send(ctx, buffer.Bytes()); err != nil {
 		writeErr.Err = err
 		if !retryable {
 			writeErr.MetricsReject = append(writeErr.MetricsAccept, batchIndices...)
@@ -379,7 +388,7 @@ func (a *AzureMonitor) Write(metrics []telegraf.Metric) error {
 	return writeErr
 }
 
-func (a *AzureMonitor) send(body []byte) (bool, error) {
+func (a *AzureMonitor) send(ctx context.Context, body []byte) (bool, error) {
 	var buf bytes.Buffer
 	g := gzip.NewWriter(&buf)
 	if _, err := g.Write(body); err != nil {
@@ -389,7 +398,7 @@ func (a *AzureMonitor) send(body []byte) (bool, error) {
 		return false, fmt.Errorf("closing gzip writer failed: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", a.url, &buf)
+	req, err := http.NewRequestWithContext(ctx, "POST", a.url, &buf)
 	if err != nil {
 		return false, fmt.Errorf("creating request failed: %w", err)
 	}
@@ -432,8 +441,8 @@ func (a *AzureMonitor) send(body []byte) (bool, error) {
 }
 
 // vmMetadata retrieves metadata about the current Azure VM
-func vmInstanceMetadata(c *http.Client) (region, resourceID string, err error) {
-	req, err := http.NewRequest("GET", vmInstanceMetadataURL, nil)
+func vmInstanceMetadata(ctx context.Context, c *http.Client) (region, resourceID string, err error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", vmInstanceMetadataURL, nil)
 	if err != nil {
 		return "", "", fmt.Errorf("error creating request: %w", err)
 	}
