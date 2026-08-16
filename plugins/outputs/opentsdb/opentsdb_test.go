@@ -1,6 +1,7 @@
 package opentsdb
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"reflect"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -200,4 +202,62 @@ func TestWriteIntegration(t *testing.T) {
 
 	err = o.Write(metrics)
 	require.NoError(t, err)
+}
+
+func TestWriteTelnetContextCancelUnblocksBlockedWrite(t *testing.T) {
+	// net.Pipe is fully synchronous: a Write blocks until the peer Reads,
+	// giving a deterministic (non-timing-dependent) blocked write.
+	client, server := net.Pipe()
+	defer server.Close()
+
+	o := &OpenTSDB{Log: testutil.Logger{}}
+	metrics := []telegraf.Metric{testutil.TestMetric(float64(42.0), "justametric.float")}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- o.writeTelnetConn(ctx, client, metrics)
+	}()
+
+	// Let the write actually reach the blocked conn.Write before cancelling.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.Error(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("writeTelnetConn did not return promptly after context cancellation")
+	}
+}
+
+func TestWriteHTTPContextCancelUnblocksBlockedRequest(t *testing.T) {
+	blockUntil := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		<-blockUntil
+	}))
+	defer ts.Close()
+	defer close(blockUntil)
+
+	u, err := url.Parse(ts.URL)
+	require.NoError(t, err)
+
+	o := &OpenTSDB{Log: testutil.Logger{}, HTTPBatchSize: 1}
+	metrics := []telegraf.Metric{testutil.TestMetric(float64(42.0), "justametric.float")}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- o.WriteHTTP(ctx, metrics, u)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.Error(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("WriteHTTP did not return promptly after context cancellation")
+	}
 }

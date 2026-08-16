@@ -3,6 +3,7 @@ package opentsdb
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -99,7 +100,7 @@ func (r *requestBody) close() error {
 	return nil
 }
 
-func (o *openTSDBHttp) sendDataPoint(metric *HTTPMetric) error {
+func (o *openTSDBHttp) sendDataPoint(ctx context.Context, metric *HTTPMetric) error {
 	if o.metricCounter == 0 {
 		o.body.reset(o.Debug)
 	}
@@ -110,7 +111,7 @@ func (o *openTSDBHttp) sendDataPoint(metric *HTTPMetric) error {
 
 	o.metricCounter++
 	if o.metricCounter == o.BatchSize {
-		if err := o.flush(); err != nil {
+		if err := o.flush(ctx); err != nil {
 			return err
 		}
 
@@ -120,7 +121,7 @@ func (o *openTSDBHttp) sendDataPoint(metric *HTTPMetric) error {
 	return nil
 }
 
-func (o *openTSDBHttp) flush() error {
+func (o *openTSDBHttp) flush(ctx context.Context) error {
 	if o.metricCounter == 0 {
 		return nil
 	}
@@ -140,7 +141,7 @@ func (o *openTSDBHttp) flush() error {
 		u.RawQuery = "details"
 	}
 
-	req, err := http.NewRequest("POST", u.String(), &o.body.b)
+	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), &o.body.b)
 	if err != nil {
 		return fmt.Errorf("error when building request: %w", err)
 	}

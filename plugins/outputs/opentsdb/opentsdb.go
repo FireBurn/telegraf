@@ -2,6 +2,7 @@
 package opentsdb
 
 import (
+	"context"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/outputs"
 )
 
@@ -62,6 +64,12 @@ func (*OpenTSDB) SampleConfig() string {
 }
 
 func (o *OpenTSDB) Connect() error {
+	return o.ConnectContext(context.Background())
+}
+
+// ConnectContext probes connectivity to the OpenTSDB server, aborting the
+// dial when ctx is cancelled.
+func (o *OpenTSDB) ConnectContext(ctx context.Context) error {
 	if !strings.HasPrefix(o.Host, "http") && !strings.HasPrefix(o.Host, "tcp") {
 		o.Host = "tcp://" + o.Host
 	}
@@ -72,11 +80,8 @@ func (o *OpenTSDB) Connect() error {
 	}
 
 	uri := fmt.Sprintf("%s:%d", u.Host, o.Port)
-	tcpAddr, err := net.ResolveTCPAddr("tcp", uri)
-	if err != nil {
-		return fmt.Errorf("failed to resolve TCP address: %w", err)
-	}
-	connection, err := net.DialTCP("tcp", nil, tcpAddr)
+	var d net.Dialer
+	connection, err := d.DialContext(ctx, "tcp", uri)
 	if err != nil {
 		return fmt.Errorf("failed to connect to OpenTSDB: %w", err)
 	}
@@ -85,6 +90,12 @@ func (o *OpenTSDB) Connect() error {
 }
 
 func (o *OpenTSDB) Write(metrics []telegraf.Metric) error {
+	return o.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes metrics, aborting an in-flight dial/write/HTTP
+// request when ctx is cancelled.
+func (o *OpenTSDB) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if len(metrics) == 0 {
 		return nil
 	}
@@ -95,14 +106,14 @@ func (o *OpenTSDB) Write(metrics []telegraf.Metric) error {
 	}
 
 	if u.Scheme == "" || u.Scheme == "tcp" {
-		return o.WriteTelnet(metrics, u)
+		return o.WriteTelnet(ctx, metrics, u)
 	} else if u.Scheme == "http" || u.Scheme == "https" {
-		return o.WriteHTTP(metrics, u)
+		return o.WriteHTTP(ctx, metrics, u)
 	}
 	return errors.New("unknown scheme in host parameter")
 }
 
-func (o *OpenTSDB) WriteHTTP(metrics []telegraf.Metric, u *url.URL) error {
+func (o *OpenTSDB) WriteHTTP(ctx context.Context, metrics []telegraf.Metric, u *url.URL) error {
 	http := openTSDBHttp{
 		Host:      u.Host,
 		Port:      o.Port,
@@ -140,27 +151,37 @@ func (o *OpenTSDB) WriteHTTP(metrics []telegraf.Metric, u *url.URL) error {
 				Value:     value,
 			}
 
-			if err := http.sendDataPoint(metric); err != nil {
+			if err := http.sendDataPoint(ctx, metric); err != nil {
 				return err
 			}
 		}
 	}
 
-	return http.flush()
+	return http.flush(ctx)
 }
 
-func (o *OpenTSDB) WriteTelnet(metrics []telegraf.Metric, u *url.URL) error {
+func (o *OpenTSDB) WriteTelnet(ctx context.Context, metrics []telegraf.Metric, u *url.URL) error {
 	// Send Data with telnet / socket communication
 	uri := fmt.Sprintf("%s:%d", u.Host, o.Port)
-	tcpAddr, err := net.ResolveTCPAddr("tcp", uri)
-	if err != nil {
-		return fmt.Errorf("failed to resolve TCP address: %w", err)
-	}
-	connection, err := net.DialTCP("tcp", nil, tcpAddr)
+	var d net.Dialer
+	connection, err := d.DialContext(ctx, "tcp", uri)
 	if err != nil {
 		return fmt.Errorf("failed to connect to OpenTSDB: %w", err)
 	}
 	defer connection.Close()
+
+	return o.writeTelnetConn(ctx, connection, metrics)
+}
+
+// writeTelnetConn writes metrics to an already-established connection,
+// forcing an in-flight write to abort via a deadline on cancellation;
+// net.Conn has no native context support.
+func (o *OpenTSDB) writeTelnetConn(ctx context.Context, connection net.Conn, metrics []telegraf.Metric) error {
+	// The connection is closed by the caller once this returns, so a forced
+	// deadline cannot poison a later write; stop() is only needed to retire
+	// the watcher before that close happens.
+	stop := internal.CancelConnOnContext(ctx, connection)
+	defer stop()
 
 	for _, m := range metrics {
 		now := m.Time().UnixNano() / 1000000000
@@ -190,8 +211,7 @@ func (o *OpenTSDB) WriteTelnet(metrics []telegraf.Metric, u *url.URL) error {
 				sanitize(fmt.Sprintf("%s%s%s%s", o.Prefix, m.Name(), o.Separator, fieldName)),
 				now, metricValue, tags)
 
-			_, err = connection.Write([]byte(messageLine))
-			if err != nil {
+			if _, err := connection.Write([]byte(messageLine)); err != nil {
 				return fmt.Errorf("telnet writing error: %w", err)
 			}
 		}

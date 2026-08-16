@@ -9,6 +9,21 @@ the telnet or HTTP mode. Using the HTTP API is recommended since OpenTSDB 2.0.
 
 [opentsdb]: http://opentsdb.net/
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds connection setup and the outbound write, whether
+using the telnet/socket protocol or the HTTP API. On cancellation, the
+telnet connection is closed and Telegraf reconnects on the next write.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: the destination may or may not have received some or all of the
+metrics. Telegraf keeps the batch for retry, so a cancelled write can result
+in duplicate metrics.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Global configuration options <!-- @/docs/includes/plugin_config.md -->
 
 Plugins support additional global and plugin configuration settings for tasks
