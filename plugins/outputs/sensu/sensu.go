@@ -3,6 +3,7 @@ package sensu
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -154,6 +155,11 @@ func (s *Sensu) Close() error {
 }
 
 func (s *Sensu) Write(metrics []telegraf.Metric) error {
+	return s.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes the metrics to Sensu. It can be cancelled via the context.
+func (s *Sensu) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	var points []*outputMetric
 	for _, metric := range metrics {
 		// Add tags from config to each metric point
@@ -206,10 +212,10 @@ func (s *Sensu) Write(metrics []telegraf.Metric) error {
 		return err
 	}
 
-	return s.writeMetrics(reqBody)
+	return s.writeMetrics(ctx, reqBody)
 }
 
-func (s *Sensu) writeMetrics(reqBody []byte) error {
+func (s *Sensu) writeMetrics(ctx context.Context, reqBody []byte) error {
 	var reqBodyBuffer io.Reader = bytes.NewBuffer(reqBody)
 	method := http.MethodPost
 
@@ -219,7 +225,7 @@ func (s *Sensu) writeMetrics(reqBody []byte) error {
 		reqBodyBuffer = rc
 	}
 
-	req, err := http.NewRequest(method, s.EndpointURL, reqBodyBuffer)
+	req, err := http.NewRequestWithContext(ctx, method, s.EndpointURL, reqBodyBuffer)
 	if err != nil {
 		return err
 	}

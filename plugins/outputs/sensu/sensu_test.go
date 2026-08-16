@@ -1,6 +1,7 @@
 package sensu
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"testing"
+	"time"
 
 	corev2 "github.com/sensu/sensu-go/api/core/v2"
 	"github.com/stretchr/testify/require"
@@ -71,6 +73,40 @@ func TestResolveEventEndpointUrl(t *testing.T) {
 			require.Equal(t, err, error(nil))
 			require.Equal(t, tt.expectedEndpointURL, tt.plugin.EndpointURL)
 		})
+	}
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	unblock := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer ts.Close()
+	defer close(unblock)
+
+	testURL := "http://" + ts.Listener.Addr().String()
+	testCheck := "telegraf"
+	plugin := &Sensu{
+		AgentAPIURL: &testURL,
+		Check:       &sensuCheck{Name: &testCheck},
+		Log:         testutil.Logger{},
+	}
+	require.NoError(t, plugin.Connect())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- plugin.WriteContext(ctx, []telegraf.Metric{testutil.TestMetric(42.0, "cpu")})
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
 	}
 }
 
