@@ -2,6 +2,7 @@
 package azure_data_explorer
 
 import (
+	"context"
 	_ "embed"
 	"fmt"
 	"time"
@@ -55,13 +56,17 @@ func (adx *AzureDataExplorer) Close() error {
 }
 
 func (adx *AzureDataExplorer) Write(metrics []telegraf.Metric) error {
-	if adx.MetricsGrouping == common_adx.TablePerMetric {
-		return adx.writeTablePerMetric(metrics)
-	}
-	return adx.writeSingleTable(metrics)
+	return adx.WriteContext(context.Background(), metrics)
 }
 
-func (adx *AzureDataExplorer) writeTablePerMetric(metrics []telegraf.Metric) error {
+func (adx *AzureDataExplorer) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
+	if adx.MetricsGrouping == common_adx.TablePerMetric {
+		return adx.writeTablePerMetric(ctx, metrics)
+	}
+	return adx.writeSingleTable(ctx, metrics)
+}
+
+func (adx *AzureDataExplorer) writeTablePerMetric(ctx context.Context, metrics []telegraf.Metric) error {
 	tableMetricGroups := make(map[string][]byte)
 	// Group metrics by name and serialize them
 	for _, m := range metrics {
@@ -80,7 +85,7 @@ func (adx *AzureDataExplorer) writeTablePerMetric(metrics []telegraf.Metric) err
 	// Push the metrics for each table
 	format := azkustoingest.FileFormat(azkustoingest.JSON)
 	for tableName, tableMetrics := range tableMetricGroups {
-		if err := adx.client.PushMetrics(format, tableName, tableMetrics); err != nil {
+		if err := adx.client.PushMetrics(ctx, format, tableName, tableMetrics); err != nil {
 			return err
 		}
 	}
@@ -88,7 +93,7 @@ func (adx *AzureDataExplorer) writeTablePerMetric(metrics []telegraf.Metric) err
 	return nil
 }
 
-func (adx *AzureDataExplorer) writeSingleTable(metrics []telegraf.Metric) error {
+func (adx *AzureDataExplorer) writeSingleTable(ctx context.Context, metrics []telegraf.Metric) error {
 	// serialise each metric in metrics - store in byte[]
 	metricsArray := make([]byte, 0)
 	for _, m := range metrics {
@@ -101,7 +106,7 @@ func (adx *AzureDataExplorer) writeSingleTable(metrics []telegraf.Metric) error 
 
 	// push metrics to a single table
 	format := azkustoingest.FileFormat(azkustoingest.JSON)
-	err := adx.client.PushMetrics(format, adx.TableName, metricsArray)
+	err := adx.client.PushMetrics(ctx, format, adx.TableName, metricsArray)
 	return err
 }
 

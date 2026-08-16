@@ -31,6 +31,20 @@ plugin ordering. See [CONFIGURATION.md][CONFIGURATION.md] for more details.
 
 [CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds each per-table ingestion request made during a
+write.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: Azure Data Explorer may or may not have received the metrics for
+tables that were still being ingested. Telegraf keeps the batch for retry,
+so a cancelled write can result in duplicate metrics.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Configuration
 
 ```toml @sample.conf

@@ -80,7 +80,44 @@ func TestPushMetrics(t *testing.T) {
 	}
 
 	metrics := []byte(`{"fields": {"value": 1}, "name": "test1", "tags": {"tag1": "value1"}, "timestamp": "2021-01-01T00:00:00Z"}`)
-	require.NoError(t, plugin.PushMetrics(azkustoingest.FileFormat(azkustoingest.JSON), "test1", metrics))
+	require.NoError(t, plugin.PushMetrics(context.Background(), azkustoingest.FileFormat(azkustoingest.JSON), "test1", metrics))
+}
+
+func TestPushMetricsContextCancellation(t *testing.T) {
+	ingestor := &blockingIngestor{entered: make(chan struct{})}
+	plugin := Client{
+		cfg: &Config{
+			Database:      "mydb",
+			Endpoint:      "https://ingest-test.westus.kusto.windows.net",
+			IngestionType: QueuedIngestion,
+			Timeout:       config.Duration(time.Minute),
+		},
+		ingestors: map[string]azkustoingest.Ingestor{"test1": ingestor},
+		logger:    testutil.Logger{},
+	}
+
+	metrics := []byte(`{"fields": {"value": 1}, "name": "test1", "tags": {"tag1": "value1"}, "timestamp": "2021-01-01T00:00:00Z"}`)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() {
+		done <- plugin.PushMetrics(ctx, azkustoingest.FileFormat(azkustoingest.JSON), "test1", metrics)
+	}()
+
+	select {
+	case <-ingestor.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("FromReader was never called")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("PushMetrics did not return promptly after context cancellation")
+	}
 }
 
 func TestPushMetricsOutputs(t *testing.T) {
@@ -165,7 +202,7 @@ func TestPushMetricsOutputs(t *testing.T) {
 
 			format := azkustoingest.FileFormat(azkustoingest.JSON)
 			for tableName, tableMetrics := range tableMetricGroups {
-				require.NoError(t, client.PushMetrics(format, tableName, tableMetrics))
+				require.NoError(t, client.PushMetrics(context.Background(), format, tableName, tableMetrics))
 				createdFakeIngestor := ingestor
 				require.EqualValues(t, expectedMetric["metricName"], createdFakeIngestor.actualOutputMetric["name"])
 				require.EqualValues(t, expectedMetric["fields"], createdFakeIngestor.actualOutputMetric["fields"])
@@ -214,5 +251,23 @@ func (*fakeIngestor) FromFile(_ context.Context, _ string, _ ...azkustoingest.Fi
 }
 
 func (*fakeIngestor) Close() error {
+	return nil
+}
+
+type blockingIngestor struct {
+	entered chan struct{}
+}
+
+func (b *blockingIngestor) FromReader(ctx context.Context, _ io.Reader, _ ...azkustoingest.FileOption) (*azkustoingest.Result, error) {
+	close(b.entered)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (*blockingIngestor) FromFile(_ context.Context, _ string, _ ...azkustoingest.FileOption) (*azkustoingest.Result, error) {
+	return &azkustoingest.Result{}, nil
+}
+
+func (*blockingIngestor) Close() error {
 	return nil
 }

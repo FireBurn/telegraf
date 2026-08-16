@@ -114,8 +114,7 @@ func (adx *Client) Close() error {
 	return errs.GetError()
 }
 
-func (adx *Client) PushMetrics(format azkustoingest.FileOption, tableName string, metrics []byte) error {
-	ctx := context.Background()
+func (adx *Client) PushMetrics(ctx context.Context, format azkustoingest.FileOption, tableName string, metrics []byte) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(adx.cfg.Timeout))
 	defer cancel()
 	metricIngestor, err := adx.getMetricIngestor(ctx, tableName)
