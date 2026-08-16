@@ -1,8 +1,11 @@
 package cloud_pubsub
 
 import (
+	"context"
 	"encoding/base64"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/pubsub/v2"
 	"github.com/stretchr/testify/require"
@@ -10,8 +13,74 @@ import (
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/parsers/influx"
+	serializers_influx "github.com/influxdata/telegraf/plugins/serializers/influx"
 	"github.com/influxdata/telegraf/testutil"
 )
+
+// blockingResult is a publishResult whose Get only returns once its context
+// is cancelled or release is closed, used to verify WriteContext returns
+// promptly on cancellation without waiting for a real publish.
+type blockingResult struct {
+	release chan struct{}
+}
+
+func (r *blockingResult) Get(ctx context.Context) (string, error) {
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-r.release:
+		return "id", nil
+	}
+}
+
+type blockingTopic struct {
+	reached atomic.Bool
+	release chan struct{}
+}
+
+func (*blockingTopic) ID() string { return "test-topic" }
+func (*blockingTopic) Stop()      {}
+func (bt *blockingTopic) Publish(context.Context, *pubsub.Message) publishResult {
+	bt.reached.Store(true)
+	return &blockingResult{release: bt.release}
+}
+func (*blockingTopic) PublishSettings() pubsub.PublishSettings { return pubsub.PublishSettings{} }
+func (*blockingTopic) SetPublishSettings(pubsub.PublishSettings) {}
+
+func TestPubSub_WriteContextCancellation(t *testing.T) {
+	bt := &blockingTopic{release: make(chan struct{})}
+	defer close(bt.release)
+
+	s := &serializers_influx.Serializer{}
+	require.NoError(t, s.Init())
+
+	ps := &PubSub{
+		Project:   "test-project",
+		Topic:     "test-topic",
+		stubTopic: func(string) topic { return bt },
+	}
+	require.NoError(t, ps.Init())
+	var err error
+	ps.encoder, err = internal.NewContentEncoder("identity")
+	require.NoError(t, err)
+	ps.SetSerializer(s)
+
+	metrics := []telegraf.Metric{testutil.TestMetric("value_1", "test")}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() { result <- ps.WriteContext(ctx, metrics) }()
+
+	require.Eventually(t, bt.reached.Load, time.Second, time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
+}
 
 func TestPubSub_WriteSingle(t *testing.T) {
 	testMetrics := []testMetric{

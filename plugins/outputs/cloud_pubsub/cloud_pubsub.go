@@ -59,8 +59,14 @@ func (ps *PubSub) SetSerializer(serializer telegraf.Serializer) {
 }
 
 func (ps *PubSub) Connect() error {
+	return ps.ConnectContext(context.Background())
+}
+
+// ConnectContext connects to PubSub, passing ctx through to client setup so a
+// stuck connection attempt can be cancelled.
+func (ps *PubSub) ConnectContext(ctx context.Context) error {
 	if ps.stubTopic == nil {
-		return ps.initPubSubClient()
+		return ps.initPubSubClient(ctx)
 	}
 
 	return nil
@@ -74,6 +80,12 @@ func (ps *PubSub) Close() error {
 }
 
 func (ps *PubSub) Write(metrics []telegraf.Metric) error {
+	return ps.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext publishes the metrics to PubSub, passing ctx through to Publish
+// and Get so a stuck write can be cancelled.
+func (ps *PubSub) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	ps.refreshTopic()
 
 	// Serialize metrics and package into appropriate PubSub messages
@@ -82,7 +94,7 @@ func (ps *PubSub) Write(metrics []telegraf.Metric) error {
 		return err
 	}
 
-	cctx, cancel := context.WithCancel(context.Background())
+	cctx, cancel := context.WithCancel(ctx)
 
 	// Publish all messages - each call to Publish returns a future.
 	ps.publishResults = make([]publishResult, 0, len(msgs))
@@ -97,7 +109,7 @@ func (ps *PubSub) Write(metrics []telegraf.Metric) error {
 	return ps.waitForResults(cctx, cancel)
 }
 
-func (ps *PubSub) initPubSubClient() error {
+func (ps *PubSub) initPubSubClient(ctx context.Context) error {
 	var credsOpt option.ClientOption
 	if ps.CredentialsFile != "" {
 		credType, err := common_gcp.ParseCredentialType(ps.CredentialsFile)
@@ -106,7 +118,7 @@ func (ps *PubSub) initPubSubClient() error {
 		}
 		credsOpt = option.WithAuthCredentialsFile(option.CredentialsType(credType), ps.CredentialsFile)
 	} else {
-		creds, err := google.FindDefaultCredentials(context.Background(), pubsub.ScopeCloudPlatform)
+		creds, err := google.FindDefaultCredentials(ctx, pubsub.ScopeCloudPlatform)
 		if err != nil {
 			return fmt.Errorf(
 				"unable to find GCP Application Default Credentials: %v."+
@@ -115,7 +127,7 @@ func (ps *PubSub) initPubSubClient() error {
 		credsOpt = option.WithCredentials(creds)
 	}
 	client, err := pubsub.NewClient(
-		context.Background(),
+		ctx,
 		ps.Project,
 		credsOpt,
 		option.WithScopes(pubsub.ScopeCloudPlatform),
