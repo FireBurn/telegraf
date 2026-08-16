@@ -3,6 +3,7 @@ package instrumental
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/outputs"
 	"github.com/influxdata/telegraf/plugins/serializers/graphite"
 )
@@ -73,16 +75,21 @@ func (i *Instrumental) Init() error {
 }
 
 func (i *Instrumental) Connect() error {
-	addr := net.JoinHostPort(i.Host, strconv.Itoa(i.Port))
-	connection, err := net.DialTimeout("tcp", addr, time.Duration(i.Timeout))
+	return i.ConnectContext(context.Background())
+}
 
+// ConnectContext dials and authenticates, aborting the dial and the
+// authentication handshake when ctx is cancelled.
+func (i *Instrumental) ConnectContext(ctx context.Context) error {
+	addr := net.JoinHostPort(i.Host, strconv.Itoa(i.Port))
+	d := net.Dialer{Timeout: time.Duration(i.Timeout)}
+	connection, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		i.conn = nil
 		return err
 	}
 
-	err = i.authenticate(connection)
-	if err != nil {
+	if err := i.authenticate(ctx, connection); err != nil {
 		i.conn = nil
 		return err
 	}
@@ -97,8 +104,14 @@ func (i *Instrumental) Close() error {
 }
 
 func (i *Instrumental) Write(metrics []telegraf.Metric) error {
+	return i.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes metrics, aborting an in-flight (re)connect or write
+// via a forced deadline when ctx is cancelled.
+func (i *Instrumental) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if i.conn == nil {
-		err := i.Connect()
+		err := i.ConnectContext(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to (re)connect to Instrumental. Error: %w", err)
 		}
@@ -161,12 +174,20 @@ func (i *Instrumental) Write(metrics []telegraf.Metric) error {
 	}
 
 	allPoints := strings.Join(points, "")
-	if _, err := fmt.Fprint(i.conn, allPoints); err != nil {
-		if errors.Is(err, io.EOF) {
+
+	// Capture the connection the watcher is allowed to touch; i.Close() below
+	// clears i.conn, which a watcher re-reading the field would race.
+	conn := i.conn
+	stop := internal.CancelConnOnContext(ctx, conn)
+	_, writeErr := fmt.Fprint(conn, allPoints)
+	stop()
+
+	if writeErr != nil {
+		if errors.Is(writeErr, io.EOF) || ctx.Err() != nil {
 			_ = i.Close()
 		}
 
-		return err
+		return writeErr
 	}
 
 	// force the connection closed after sending data
@@ -177,12 +198,17 @@ func (i *Instrumental) Write(metrics []telegraf.Metric) error {
 	return nil
 }
 
-func (i *Instrumental) authenticate(conn net.Conn) error {
+func (i *Instrumental) authenticate(ctx context.Context, conn net.Conn) error {
 	token, err := i.APIToken.Get()
 	if err != nil {
 		return fmt.Errorf("getting token failed: %w", err)
 	}
 	defer token.Destroy()
+
+	// The caller discards the connection if this fails, so a forced deadline
+	// cannot poison a later write; stop() only retires the watcher.
+	stop := internal.CancelConnOnContext(ctx, conn)
+	defer stop()
 
 	if _, err := fmt.Fprintf(conn, HandshakeFormat, token.TemporaryString()); err != nil {
 		return err

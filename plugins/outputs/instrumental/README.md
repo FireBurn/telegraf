@@ -23,6 +23,22 @@ plugin ordering. See [CONFIGURATION.md][CONFIGURATION.md] for more details.
 
 [CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds connection setup (dial and the authentication
+handshake, including waiting for the server's response) and the outbound
+network write. On cancellation, the connection is closed and Telegraf
+reconnects on the next write.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: the destination may or may not have received the metrics. Telegraf
+keeps the batch for retry, so a cancelled write can result in duplicate
+metrics.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Secret store support
 
 This plugin supports secrets from secret stores for the `api_token` option.

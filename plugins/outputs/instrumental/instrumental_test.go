@@ -2,6 +2,7 @@ package instrumental
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -16,6 +17,51 @@ import (
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/metric"
 )
+
+func TestConnectContextCancelUnblocksAuth(t *testing.T) {
+	// authenticate() previously had no deadline at all on its response Read;
+	// a server that accepts but never replies would hang ConnectContext
+	// forever. Verify cancellation now bounds it.
+	tcpServer, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer tcpServer.Close()
+
+	go func() {
+		conn, err := tcpServer.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Drain the hello/auth lines but never send a response.
+		buf := make([]byte, 512)
+		_, _ = conn.Read(buf)
+	}()
+
+	port := tcpServer.Addr().(*net.TCPAddr).Port
+	i := Instrumental{
+		Host:     "127.0.0.1",
+		Port:     port,
+		APIToken: config.NewSecret([]byte("abc123token")),
+	}
+	require.NoError(t, i.Init())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- i.ConnectContext(ctx)
+	}()
+
+	// Let the connection actually reach the blocked auth Read before cancelling.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.Error(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("ConnectContext did not return promptly after context cancellation")
+	}
+}
 
 func TestWrite(t *testing.T) {
 	var wg sync.WaitGroup
