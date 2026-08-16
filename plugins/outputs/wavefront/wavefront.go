@@ -80,8 +80,8 @@ func (w *Wavefront) parseConnectionURL() (string, error) {
 	return u.String(), nil
 }
 
-func (w *Wavefront) createSender(connectionURL string, flushSeconds int) (wavefront.Sender, error) {
-	client, err := w.CreateClient(context.Background(), w.Log)
+func (w *Wavefront) createSender(ctx context.Context, connectionURL string, flushSeconds int) (wavefront.Sender, error) {
+	client, err := w.CreateClient(ctx, w.Log)
 	if err != nil {
 		return nil, err
 	}
@@ -103,6 +103,10 @@ func (w *Wavefront) createSender(connectionURL string, flushSeconds int) (wavefr
 }
 
 func (w *Wavefront) Connect() error {
+	return w.ConnectContext(context.Background())
+}
+
+func (w *Wavefront) ConnectContext(ctx context.Context) error {
 	flushSeconds := 5
 	if w.ImmediateFlush {
 		flushSeconds = 86400 // Set a very long flush interval if we're flushing directly
@@ -112,7 +116,7 @@ func (w *Wavefront) Connect() error {
 		return err
 	}
 
-	sender, err := w.createSender(connectionURL, flushSeconds)
+	sender, err := w.createSender(ctx, connectionURL, flushSeconds)
 
 	if err != nil {
 		return errors.New("could not create Wavefront Sender for the provided url")

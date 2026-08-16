@@ -25,6 +25,20 @@ to use them.
 
 [SECRETSTORE]: ../../../docs/CONFIGURATION.md#secret-store-secrets
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface for
+connection setup and therefore supports the [`write_timeout`][write_timeout]
+output option during connect. The deadline bounds building the HTTP client
+used by the Wavefront sender, including any OAuth2 token acquisition.
+
+`write_timeout` does not currently bound the per-write send/flush path: the
+underlying Wavefront SDK buffers points locally and has no context-aware
+send call, and any actual network flush is already bounded by the HTTP
+client's own timeout rather than by `write_timeout`.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Configuration
 
 ```toml @sample.conf
