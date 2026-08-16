@@ -145,6 +145,15 @@ func (*Elasticsearch) SampleConfig() string {
 }
 
 func (a *Elasticsearch) Connect() error {
+	return a.ConnectContext(context.Background())
+}
+
+// ConnectContext sets up the Elasticsearch client. The olivere/elastic v6
+// client is a native context.Context passthrough all the way down to the
+// underlying http.Request (elastic.DialContext, and PingService.Do/
+// BulkService.Do below), so cancellation is a plain passthrough here rather
+// than requiring a goroutine-race.
+func (a *Elasticsearch) ConnectContext(ctx context.Context) error {
 	if a.URLs == nil || a.IndexName == "" {
 		return errors.New("elasticsearch urls or index_name is not defined")
 	}
@@ -158,7 +167,7 @@ func (a *Elasticsearch) Connect() error {
 		return fmt.Errorf("invalid float_handling type %q", a.FloatHandling)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(a.Timeout))
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(a.Timeout))
 	defer cancel()
 
 	var clientOptions []elastic.ClientOptionFunc
@@ -209,18 +218,21 @@ func (a *Elasticsearch) Connect() error {
 		a.Log.Debugf("Disabling health check")
 	}
 
-	client, err := elastic.NewClient(clientOptions...)
+	client, err := elastic.DialContext(ctx, clientOptions...)
 
 	if err != nil {
 		return err
 	}
 
-	// check for ES version on first node
-	esVersion, err := client.ElasticsearchVersion(a.URLs[0])
+	// check for ES version on first node. Inlined from
+	// Client.ElasticsearchVersion, which hard-codes context.Background()
+	// internally and so cannot be bound by ctx.
+	pingResult, _, err := client.Ping(a.URLs[0]).Do(ctx)
 
 	if err != nil {
 		return fmt.Errorf("elasticsearch version check failed: %w", err)
 	}
+	esVersion := pingResult.Version.Number
 
 	// quit if ES version is not supported
 	majorReleaseNumber, err := strconv.Atoi(strings.Split(esVersion, ".")[0])
@@ -295,6 +307,14 @@ func GetPointID(m telegraf.Metric) string {
 }
 
 func (a *Elasticsearch) Write(metrics []telegraf.Metric) error {
+	return a.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext sends the metrics to Elasticsearch via a bulk request. It
+// can be cancelled via ctx: olivere/elastic's BulkService.Do(ctx) threads
+// the context natively down to the underlying http.Request, so this is a
+// plain passthrough (no goroutine-race needed).
+func (a *Elasticsearch) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if len(metrics) == 0 {
 		return nil
 	}
@@ -358,7 +378,7 @@ func (a *Elasticsearch) Write(metrics []telegraf.Metric) error {
 		bulkRequest.Add(br)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(a.Timeout))
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(a.Timeout))
 	defer cancel()
 
 	res, err := bulkRequest.Do(ctx)

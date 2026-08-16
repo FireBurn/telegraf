@@ -757,6 +757,97 @@ func TestRequestHeaderWhenGzipIsDisabled(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestConnectContextCancellation(t *testing.T) {
+	unblock := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			<-unblock
+			if _, err := w.Write([]byte(`{"version": {"number": "7.8"}}`)); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				t.Error(err)
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	defer close(unblock)
+
+	urls := []string{"http://" + ts.Listener.Addr().String()}
+
+	e := &Elasticsearch{
+		URLs:           urls,
+		IndexName:      "{{host}}-%Y.%m.%d",
+		Timeout:        config.Duration(time.Minute),
+		ManageTemplate: false,
+		Log:            testutil.Logger{},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- e.ConnectContext(ctx)
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ConnectContext did not return after context cancellation")
+	}
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	unblock := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/_bulk":
+			<-unblock
+			if _, err := w.Write([]byte("{}")); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				t.Error(err)
+			}
+			return
+		default:
+			if _, err := w.Write([]byte(`{"version": {"number": "7.8"}}`)); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				t.Error(err)
+			}
+			return
+		}
+	}))
+	defer ts.Close()
+	defer close(unblock)
+
+	urls := []string{"http://" + ts.Listener.Addr().String()}
+
+	e := &Elasticsearch{
+		URLs:           urls,
+		IndexName:      "{{host}}-%Y.%m.%d",
+		Timeout:        config.Duration(time.Minute),
+		ManageTemplate: false,
+		Log:            testutil.Logger{},
+	}
+	require.NoError(t, e.Connect())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- e.WriteContext(ctx, testutil.MockMetrics())
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
+}
+
 func TestAuthorizationHeaderWhenBearerTokenIsPresent(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

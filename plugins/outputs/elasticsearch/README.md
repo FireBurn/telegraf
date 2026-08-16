@@ -246,6 +246,20 @@ to use them.
 
 [SECRETSTORE]: ../../../docs/CONFIGURATION.md#secret-store-secrets
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. The
+underlying `olivere/elastic` v6 client threads a `context.Context` natively
+down to the outbound HTTP request for both connection setup (the version
+ping and, if `manage_template` is enabled, the template check/creation
+calls) and the bulk index request made during a write, so cancellation is a
+direct passthrough with nothing left running in the background. Note that
+the plugin's own `timeout` option and `write_timeout` both bound the same
+call chain; whichever deadline is shorter takes effect.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Configuration
 
 ```toml @sample.conf
