@@ -3,6 +3,7 @@ package nebius_cloud_monitoring
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -110,8 +111,13 @@ func (a *NebiusCloudMonitoring) Init() error {
 
 // Connect initializes the plugin and validates connectivity
 func (a *NebiusCloudMonitoring) Connect() error {
+	return a.ConnectContext(context.Background())
+}
+
+// ConnectContext initializes the plugin and validates connectivity. It can be cancelled via the context.
+func (a *NebiusCloudMonitoring) ConnectContext(ctx context.Context) error {
 	a.Log.Debugf("Getting folder ID in %s", a.metadataFolderURL)
-	body, err := getResponseFromMetadata(a.client, a.metadataFolderURL)
+	body, err := getResponseFromMetadata(ctx, a.client, a.metadataFolderURL)
 	if err != nil {
 		return err
 	}
@@ -133,6 +139,11 @@ func (a *NebiusCloudMonitoring) Close() error {
 
 // Write writes metrics to the remote endpoint
 func (a *NebiusCloudMonitoring) Write(metrics []telegraf.Metric) error {
+	return a.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes metrics to the remote endpoint. It can be cancelled via the context.
+func (a *NebiusCloudMonitoring) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	var nebiusCloudMonitoringMetrics []nebiusCloudMonitoringMetric
 	for _, m := range metrics {
 		for _, field := range m.FieldList() {
@@ -163,11 +174,11 @@ func (a *NebiusCloudMonitoring) Write(metrics []telegraf.Metric) error {
 		return err
 	}
 	body = append(body, '\n')
-	return a.send(body)
+	return a.send(ctx, body)
 }
 
-func getResponseFromMetadata(c *http.Client, metadataURL string) ([]byte, error) {
-	req, err := http.NewRequest("GET", metadataURL, nil)
+func getResponseFromMetadata(ctx context.Context, c *http.Client, metadataURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", metadataURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
@@ -189,9 +200,9 @@ func getResponseFromMetadata(c *http.Client, metadataURL string) ([]byte, error)
 	return body, nil
 }
 
-func (a *NebiusCloudMonitoring) getIAMTokenFromMetadata() (string, int, error) {
+func (a *NebiusCloudMonitoring) getIAMTokenFromMetadata(ctx context.Context) (string, int, error) {
 	a.Log.Debugf("Getting new IAM token in %s", a.metadataTokenURL)
-	body, err := getResponseFromMetadata(a.client, a.metadataTokenURL)
+	body, err := getResponseFromMetadata(ctx, a.client, a.metadataTokenURL)
 	if err != nil {
 		return "", 0, err
 	}
@@ -205,8 +216,8 @@ func (a *NebiusCloudMonitoring) getIAMTokenFromMetadata() (string, int, error) {
 	return metadata.AccessToken, int(metadata.ExpiresIn), nil
 }
 
-func (a *NebiusCloudMonitoring) send(body []byte) error {
-	req, err := http.NewRequest("POST", a.Endpoint, bytes.NewBuffer(body))
+func (a *NebiusCloudMonitoring) send(ctx context.Context, body []byte) error {
+	req, err := http.NewRequestWithContext(ctx, "POST", a.Endpoint, bytes.NewBuffer(body))
 	if err != nil {
 		return err
 	}
@@ -218,7 +229,7 @@ func (a *NebiusCloudMonitoring) send(body []byte) error {
 	req.Header.Set("Content-Type", "application/json")
 	isTokenExpired := a.iamTokenExpirationTime.Before(time.Now())
 	if a.iamToken == "" || isTokenExpired {
-		token, expiresIn, err := a.getIAMTokenFromMetadata()
+		token, expiresIn, err := a.getIAMTokenFromMetadata(ctx)
 		if err != nil {
 			return err
 		}

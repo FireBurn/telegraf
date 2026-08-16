@@ -1,6 +1,7 @@
 package nebius_cloud_monitoring
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -21,6 +22,54 @@ func readBody(r *http.Request) (nebiusCloudMonitoringMessage, error) {
 	var message nebiusCloudMonitoringMessage
 	err := decoder.Decode(&message)
 	return message, err
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	metadataServer := httptest.NewServer(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/token") {
+				token := metadataIamToken{AccessToken: "token1", ExpiresIn: 123}
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				require.NoError(t, json.NewEncoder(w).Encode(token))
+				return
+			}
+			_, err := io.WriteString(w, "folder1")
+			require.NoError(t, err)
+		}),
+	)
+	defer metadataServer.Close()
+
+	unblock := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	defer close(unblock)
+
+	plugin := &NebiusCloudMonitoring{
+		Endpoint:          "http://" + ts.Listener.Addr().String() + "/metrics",
+		metadataTokenURL:  "http://" + metadataServer.Listener.Addr().String() + "/token",
+		metadataFolderURL: "http://" + metadataServer.Listener.Addr().String() + "/folder",
+		Log:               testutil.Logger{},
+	}
+	require.NoError(t, plugin.Init())
+	require.NoError(t, plugin.Connect())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- plugin.WriteContext(ctx, testutil.MockMetrics())
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
 }
 
 func TestWrite(t *testing.T) {
