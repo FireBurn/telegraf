@@ -3,6 +3,7 @@ package amon
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -57,6 +58,10 @@ func (a *Amon) Connect() error {
 }
 
 func (a *Amon) Write(metrics []telegraf.Metric) error {
+	return a.WriteContext(context.Background(), metrics)
+}
+
+func (a *Amon) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if len(metrics) == 0 {
 		return nil
 	}
@@ -86,7 +91,7 @@ func (a *Amon) Write(metrics []telegraf.Metric) error {
 	if err != nil {
 		return fmt.Errorf("unable to marshal TimeSeries: %w", err)
 	}
-	req, err := http.NewRequest("POST", a.authenticatedURL(), bytes.NewBuffer(tsBytes))
+	req, err := http.NewRequestWithContext(ctx, "POST", a.authenticatedURL(), bytes.NewBuffer(tsBytes))
 	if err != nil {
 		return fmt.Errorf("unable to create http.Request: %w", err)
 	}

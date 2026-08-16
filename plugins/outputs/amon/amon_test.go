@@ -1,14 +1,53 @@
 package amon
 
 import (
+	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/testutil"
 )
+
+func TestWriteContextCancellation(t *testing.T) {
+	unblock := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	defer close(unblock)
+
+	a := &Amon{
+		ServerKey:    "key",
+		AmonInstance: server.URL,
+		Timeout:      config.Duration(time.Minute),
+	}
+	require.NoError(t, a.Connect())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- a.WriteContext(ctx, []telegraf.Metric{testutil.TestMetric(1.0, "testpt")})
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.Error(t, err)
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
+}
 
 func TestBuildPoint(t *testing.T) {
 	var tagtests = []struct {
