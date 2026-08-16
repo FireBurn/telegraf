@@ -2,12 +2,14 @@
 package zabbix
 
 import (
+	"context"
 	_ "embed"
 	"fmt"
 	"net"
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/datadope-io/go-zabbix/v2"
@@ -46,6 +48,12 @@ type Zabbix struct {
 	lldLastSend time.Time
 	// autoregisterLastSend stores the last time autoregister data was sent to Zabbix for each host.
 	autoregisterLastSend map[string]time.Time
+	// autoregisterMu guards autoregisterLastSend, since a WriteContext call
+	// cancelled while its autoregisterPush goroutine is still running (the
+	// zabbixSender has no context support, so a cancelled call is abandoned
+	// rather than interrupted) can otherwise overlap with the next call's
+	// synchronous autoregisterAdd.
+	autoregisterMu sync.Mutex
 	// sender is the interface to send data to Zabbix.
 	sender zabbixSender
 }
@@ -93,6 +101,15 @@ func (*Zabbix) Close() error {
 
 // Write sends metrics to Zabbix server
 func (z *Zabbix) Write(metrics []telegraf.Metric) error {
+	return z.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext sends metrics to Zabbix server, returning early if ctx is
+// cancelled. zabbixSender has no context support and its Send/RegisterHost
+// calls already carry their own connect/read/write timeouts, so a
+// cancelled write abandons the in-progress call (bounded by those
+// timeouts) rather than interrupting it mid-flight.
+func (z *Zabbix) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if len(metrics) == 0 {
 		return nil
 	}
@@ -126,13 +143,23 @@ func (z *Zabbix) Write(metrics []telegraf.Metric) error {
 		}
 	}
 
-	// Send metrics to Zabbix server
-	err := z.sendZabbixMetrics(zbxMetrics)
+	done := make(chan error, 1)
+	go func() {
+		// Send metrics to Zabbix server
+		err := z.sendZabbixMetrics(zbxMetrics)
 
-	// Send autoregister data after sending metrics.
-	z.autoregisterPush()
+		// Send autoregister data after sending metrics.
+		z.autoregisterPush()
 
-	return err
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // sendZabbixMetrics sends metrics to Zabbix server
@@ -163,7 +190,7 @@ func (z *Zabbix) sendZabbixMetrics(zbxMetrics []*zabbix.Metric) error {
 
 // processMetric converts a Telegraf metric to a list of Zabbix metrics.
 // Ignore metrics with no hostname.
-func (z Zabbix) processMetric(metric telegraf.Metric) []*zabbix.Metric {
+func (z *Zabbix) processMetric(metric telegraf.Metric) []*zabbix.Metric {
 	zbxMetrics := make([]*zabbix.Metric, 0, len(metric.FieldList()))
 
 	for _, field := range metric.FieldList() {
@@ -180,7 +207,7 @@ func (z Zabbix) processMetric(metric telegraf.Metric) []*zabbix.Metric {
 }
 
 // buildZabbixMetric builds a Zabbix metric from a Telegraf metric, for one particular value.
-func (z Zabbix) buildZabbixMetric(metric telegraf.Metric, fieldName string, value interface{}) (*zabbix.Metric, error) {
+func (z *Zabbix) buildZabbixMetric(metric telegraf.Metric, fieldName string, value interface{}) (*zabbix.Metric, error) {
 	hostname, err := getHostname(z.HostTag, metric)
 	if err != nil {
 		return nil, fmt.Errorf("error getting hostname: %w", err)

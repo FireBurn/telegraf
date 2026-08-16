@@ -11,16 +11,24 @@ func (z *Zabbix) autoregisterAdd(hostname string) {
 		return
 	}
 
+	z.autoregisterMu.Lock()
+	defer z.autoregisterMu.Unlock()
 	if _, exists := z.autoregisterLastSend[hostname]; !exists {
 		z.autoregisterLastSend[hostname] = time.Time{}
 	}
 }
 
-// Push sends autoregister data to Zabbix for each host.
+// Push sends autoregister data to Zabbix for each host. It runs in the
+// WriteContext goroutine and may still be running after a cancelled call
+// returns, so it holds autoregisterMu for its whole body to stay safe
+// against the next call's autoregisterAdd.
 func (z *Zabbix) autoregisterPush() {
 	if z.Autoregister == "" {
 		return
 	}
+
+	z.autoregisterMu.Lock()
+	defer z.autoregisterMu.Unlock()
 
 	// For each "host" tag seen, send an autoregister request to Zabbix server.
 	// z.AutoregisterSendPeriod is the interval at which requests are resend.
