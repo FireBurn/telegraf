@@ -4,6 +4,7 @@ package graylog
 import (
 	"bytes"
 	"compress/zlib"
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	_ "embed"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/internal"
 	common_tls "github.com/influxdata/telegraf/plugins/common/tls"
 	"github.com/influxdata/telegraf/plugins/outputs"
 )
@@ -48,7 +50,8 @@ type gelfConfig struct {
 
 type gelf interface {
 	io.WriteCloser
-	Connect() error
+	ConnectContext(ctx context.Context) error
+	WriteContext(ctx context.Context, message []byte) error
 }
 
 type gelfCommon struct {
@@ -106,9 +109,16 @@ func newGelfWriter(cfg gelfConfig, dialer *net.Dialer, tlsConfig *tls.Config) ge
 }
 
 func (g *gelfUDP) Write(message []byte) (n int, err error) {
+	if err := g.WriteContext(context.Background(), message); err != nil {
+		return 0, err
+	}
+	return len(message), nil
+}
+
+func (g *gelfUDP) WriteContext(ctx context.Context, message []byte) error {
 	compressed, err := g.compress(message)
 	if err != nil {
-		return 0, err
+		return err
 	}
 
 	chunksize := g.gelfConfig.MaxChunkSizeWan
@@ -120,30 +130,24 @@ func (g *gelfUDP) Write(message []byte) (n int, err error) {
 		id := make([]byte, 8)
 		_, err = rand.Read(id)
 		if err != nil {
-			return 0, err
+			return err
 		}
 
 		for i, index := 0, 0; i < length; i, index = i+chunksize, index+1 {
 			packet, err := g.createChunkedMessage(index, chunkCountInt, id, &compressed)
 			if err != nil {
-				return 0, err
+				return err
 			}
 
-			err = g.send(packet.Bytes())
-			if err != nil {
-				return 0, err
+			if err := g.send(ctx, packet.Bytes()); err != nil {
+				return err
 			}
 		}
-	} else {
-		err = g.send(compressed.Bytes())
-		if err != nil {
-			return 0, err
-		}
+	} else if err := g.send(ctx, compressed.Bytes()); err != nil {
+		return err
 	}
 
-	n = len(message)
-
-	return n, nil
+	return nil
 }
 
 func (g *gelfUDP) Close() (err error) {
@@ -230,7 +234,11 @@ func (*gelfUDP) compress(b []byte) (bytes.Buffer, error) {
 }
 
 func (g *gelfUDP) Connect() error {
-	conn, err := g.dialer.Dial("udp", g.gelfConfig.Endpoint)
+	return g.ConnectContext(context.Background())
+}
+
+func (g *gelfUDP) ConnectContext(ctx context.Context) error {
+	conn, err := g.dialer.DialContext(ctx, "udp", g.gelfConfig.Endpoint)
 	if err != nil {
 		return err
 	}
@@ -238,17 +246,32 @@ func (g *gelfUDP) Connect() error {
 	return nil
 }
 
-func (g *gelfUDP) send(b []byte) error {
+func (g *gelfUDP) send(ctx context.Context, b []byte) error {
 	if g.conn == nil {
-		err := g.Connect()
-		if err != nil {
+		if err := g.ConnectContext(ctx); err != nil {
 			return err
 		}
 	}
 
-	_, err := g.conn.Write(b)
+	// Capture the connection the watcher is allowed to touch; the error path
+	// below clears g.conn, which a watcher re-reading the field would race.
+	conn := g.conn
+	stop := internal.CancelConnOnContext(ctx, conn)
+
+	_, err := conn.Write(b)
+
+	// A cancellation that raced a successful write leaves the socket with an
+	// expired deadline, which would fail every later write. Drop it either way.
+	if stop() {
+		_ = conn.Close()
+		g.conn = nil
+		if err == nil {
+			return ctx.Err()
+		}
+		return err
+	}
 	if err != nil {
-		_ = g.conn.Close()
+		_ = conn.Close()
 		g.conn = nil
 	}
 
@@ -256,14 +279,14 @@ func (g *gelfUDP) send(b []byte) error {
 }
 
 func (g *gelfTCP) Write(message []byte) (n int, err error) {
-	err = g.send(message)
-	if err != nil {
+	if err := g.WriteContext(context.Background(), message); err != nil {
 		return 0, err
 	}
+	return len(message), nil
+}
 
-	n = len(message)
-
-	return n, nil
+func (g *gelfTCP) WriteContext(ctx context.Context, message []byte) error {
+	return g.send(ctx, message)
 }
 
 func (g *gelfTCP) Close() (err error) {
@@ -276,12 +299,26 @@ func (g *gelfTCP) Close() (err error) {
 }
 
 func (g *gelfTCP) Connect() error {
+	return g.ConnectContext(context.Background())
+}
+
+func (g *gelfTCP) ConnectContext(ctx context.Context) error {
 	var err error
 	var conn net.Conn
 	if g.tlsConfig == nil {
-		conn, err = g.dialer.Dial("tcp", g.gelfConfig.Endpoint)
+		conn, err = g.dialer.DialContext(ctx, "tcp", g.gelfConfig.Endpoint)
 	} else {
-		conn, err = tls.DialWithDialer(g.dialer, "tcp", g.gelfConfig.Endpoint, g.tlsConfig)
+		var rawConn net.Conn
+		rawConn, err = g.dialer.DialContext(ctx, "tcp", g.gelfConfig.Endpoint)
+		if err == nil {
+			tlsConn := tls.Client(rawConn, g.tlsConfig)
+			if hsErr := tlsConn.HandshakeContext(ctx); hsErr != nil {
+				rawConn.Close()
+				err = hsErr
+			} else {
+				conn = tlsConn
+			}
+		}
 	}
 	if err != nil {
 		return err
@@ -290,38 +327,62 @@ func (g *gelfTCP) Connect() error {
 	return nil
 }
 
-func (g *gelfTCP) send(b []byte) error {
+func (g *gelfTCP) send(ctx context.Context, b []byte) error {
 	if g.conn == nil {
-		if err := g.Connect(); err != nil {
+		if err := g.ConnectContext(ctx); err != nil {
 			return err
 		}
 	}
 
-	if err := g.writeFrame(b); err == nil {
+	if err := g.writeFrame(ctx, b); err == nil {
 		return nil
+	}
+
+	if ctx.Err() != nil {
+		// Cancelled: don't retry against a fresh, unbounded connection.
+		return ctx.Err()
 	}
 
 	// The peer may have closed the connection without us noticing because we
 	// only ever write to it. Reconnect and retry the write once before
 	// reporting the error to avoid noisy logs on every graceful close.
-	if err := g.Connect(); err != nil {
+	if err := g.ConnectContext(ctx); err != nil {
 		g.conn = nil
 		return err
 	}
-	return g.writeFrame(b)
+	return g.writeFrame(ctx, b)
 }
 
-func (g *gelfTCP) writeFrame(b []byte) error {
-	if _, err := g.conn.Write(b); err != nil {
-		_ = g.conn.Close()
+func (g *gelfTCP) writeFrame(ctx context.Context, b []byte) error {
+	// Capture the connection the watcher is allowed to touch; the error paths
+	// below clear g.conn, which a watcher re-reading the field would race.
+	conn := g.conn
+	stop := internal.CancelConnOnContext(ctx, conn)
+	defer stop()
+
+	discard := func() {
+		stop()
+		_ = conn.Close()
 		g.conn = nil
+	}
+
+	if _, err := conn.Write(b); err != nil {
+		discard()
 		return err
 	}
-	if _, err := g.conn.Write([]byte{0}); err != nil { // message delimiter
-		_ = g.conn.Close()
-		g.conn = nil
+	if _, err := conn.Write([]byte{0}); err != nil { // message delimiter
+		discard()
 		return err
 	}
+
+	// A cancellation that raced the successful write leaves the socket with an
+	// expired deadline, which would fail every later write. Drop it, and don't
+	// report a frame as delivered when the caller has already given up on it.
+	if stop() {
+		discard()
+		return ctx.Err()
+	}
+
 	return nil
 }
 
@@ -335,8 +396,8 @@ type Graylog struct {
 	Log               telegraf.Logger `toml:"-"`
 	common_tls.ClientConfig
 
-	writer      io.Writer
 	closers     []io.WriteCloser
+	endpoints   []gelf
 	unconnected []string
 	stopRetry   bool
 	wg          sync.WaitGroup
@@ -349,6 +410,14 @@ func (*Graylog) SampleConfig() string {
 }
 
 func (g *Graylog) Connect() error {
+	return g.ConnectContext(context.Background())
+}
+
+// ConnectContext connects to all configured servers, aborting an in-flight
+// dial/TLS-handshake when ctx is cancelled. In connection_retry mode the
+// retry loop runs in the background and Connect always returns immediately,
+// so ctx only bounds the initial (synchronous) connection attempt below.
+func (g *Graylog) ConnectContext(ctx context.Context) error {
 	if len(g.Servers) == 0 {
 		g.Servers = append(g.Servers, "localhost:12201")
 	}
@@ -364,21 +433,19 @@ func (g *Graylog) Connect() error {
 		return nil
 	}
 
-	unconnected, gelfs := g.connectEndpoints(g.Servers, tlsCfg)
+	unconnected, gelfs := g.connectEndpoints(ctx, g.Servers, tlsCfg)
 	if len(unconnected) > 0 {
 		servers := strings.Join(unconnected, ",")
 		return fmt.Errorf("connect: connection failed for %s", servers)
 	}
-	writers := make([]io.Writer, 0, len(gelfs))
 	closers := make([]io.WriteCloser, 0, len(gelfs))
 	for _, w := range gelfs {
-		writers = append(writers, w)
 		closers = append(closers, w)
 	}
 	g.Lock()
 	defer g.Unlock()
-	g.writer = io.MultiWriter(writers...)
 	g.closers = closers
+	g.endpoints = gelfs
 
 	return nil
 }
@@ -386,17 +453,17 @@ func (g *Graylog) Connect() error {
 func (g *Graylog) connectRetry(tlsCfg *tls.Config) {
 	defer g.wg.Done()
 
-	var writers []io.Writer
 	var closers []io.WriteCloser
+	var endpoints []gelf
 	var attempt int64
 
 	servers := make([]string, 0, len(g.Servers))
 	servers = append(servers, g.Servers...)
 	for {
-		unconnected, gelfs := g.connectEndpoints(servers, tlsCfg)
+		unconnected, gelfs := g.connectEndpoints(context.Background(), servers, tlsCfg)
 		for _, w := range gelfs {
-			writers = append(writers, w)
 			closers = append(closers, w)
+			endpoints = append(endpoints, w)
 		}
 		g.Lock()
 		g.unconnected = unconnected
@@ -417,18 +484,18 @@ func (g *Graylog) connectRetry(tlsCfg *tls.Config) {
 	g.Log.Info("Connected!")
 
 	g.Lock()
-	g.writer = io.MultiWriter(writers...)
 	g.closers = closers
+	g.endpoints = endpoints
 	g.Unlock()
 }
 
-func (g *Graylog) connectEndpoints(servers []string, tlsCfg *tls.Config) ([]string, []gelf) {
+func (g *Graylog) connectEndpoints(ctx context.Context, servers []string, tlsCfg *tls.Config) ([]string, []gelf) {
 	writers := make([]gelf, 0, len(servers))
 	unconnected := make([]string, 0, len(servers))
 	dialer := &net.Dialer{Timeout: time.Duration(g.Timeout)}
 	for _, server := range servers {
 		w := newGelfWriter(gelfConfig{Endpoint: server}, dialer, tlsCfg)
-		if err := w.Connect(); err != nil {
+		if err := w.ConnectContext(ctx); err != nil {
 			g.Log.Warnf("failed to connect to server [%s]: %v", server, err)
 			unconnected = append(unconnected, server)
 			continue
@@ -451,17 +518,25 @@ func (g *Graylog) Close() error {
 }
 
 func (g *Graylog) Write(metrics []telegraf.Metric) error {
+	return g.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes metrics to all connected endpoints. Each endpoint's
+// own WriteContext is responsible for aborting an in-flight write when ctx
+// is cancelled.
+func (g *Graylog) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	g.Lock()
-	writer := g.writer
+	endpoints := g.endpoints
 	g.Unlock()
 
-	if writer == nil {
+	if len(endpoints) == 0 {
 		g.Lock()
 		unconnected := strings.Join(g.unconnected, ",")
 		g.Unlock()
 
 		return fmt.Errorf("not connected to %s", unconnected)
 	}
+
 	for _, metric := range metrics {
 		values, err := g.serialize(metric)
 		if err != nil {
@@ -469,9 +544,10 @@ func (g *Graylog) Write(metrics []telegraf.Metric) error {
 		}
 
 		for _, value := range values {
-			_, err = writer.Write([]byte(value))
-			if err != nil {
-				return fmt.Errorf("error writing message: %q: %w", value, err)
+			for _, w := range endpoints {
+				if err := w.WriteContext(ctx, []byte(value)); err != nil {
+					return fmt.Errorf("error writing message: %q: %w", value, err)
+				}
 			}
 		}
 	}

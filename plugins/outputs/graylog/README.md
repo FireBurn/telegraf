@@ -27,6 +27,21 @@ the field name.
 
 [GELF spec]: https://docs.graylog.org/docs/gelf#gelf-payload-specification
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds connection setup (dial/TLS handshake) and the
+outbound network write to each configured server. On cancellation, the
+affected connection is closed and Telegraf reconnects on the next write.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: some or all configured servers may or may not have received the
+metrics. Telegraf keeps the batch for retry, so a cancelled write can result
+in duplicate metrics.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Global configuration options <!-- @/docs/includes/plugin_config.md -->
 
 Plugins support additional global and plugin configuration settings for tasks
