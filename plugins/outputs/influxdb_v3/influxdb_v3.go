@@ -99,8 +99,12 @@ func (i *InfluxDB) Close() error {
 // Write sends metrics to one of the configured servers, logging each
 // unsuccessful. If all servers fail, return an error.
 func (i *InfluxDB) Write(metrics []telegraf.Metric) error {
-	ctx := context.Background()
+	return i.WriteContext(context.Background(), metrics)
+}
 
+// WriteContext sends metrics to one of the configured servers, passing ctx
+// through to the underlying client so a write can be cancelled/bounded.
+func (i *InfluxDB) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	for _, n := range rand.Perm(len(i.clients)) {
 		client := i.clients[n]
 		if err := client.write(ctx, metrics); err != nil {

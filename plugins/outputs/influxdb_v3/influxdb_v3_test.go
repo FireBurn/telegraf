@@ -1,6 +1,7 @@
 package influxdb_v3
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -217,6 +218,45 @@ func TestWrite(t *testing.T) {
 	}
 	require.NoError(t, plugin.Write(metrics))
 	require.NoError(t, plugin.Write(metrics))
+}
+
+func TestWriteContextReturnsPromptlyOnCancellation(t *testing.T) {
+	unblock := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-unblock:
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+	defer close(unblock)
+
+	plugin := &InfluxDB{
+		URLs: []string{"http://" + ts.Listener.Addr().String()},
+		clientConfig: clientConfig{
+			Database:        "telegraf",
+			ContentEncoding: "identity",
+		},
+		Log: &testutil.Logger{},
+	}
+	require.NoError(t, plugin.Init())
+	require.NoError(t, plugin.Connect())
+	defer plugin.Close()
+
+	metrics := []telegraf.Metric{
+		metric.New("cpu", map[string]string{}, map[string]interface{}{"value": 42.0}, time.Unix(0, 0)),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := plugin.WriteContext(ctx, metrics)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	require.Less(t, elapsed, 5*time.Second)
 }
 
 func TestWriteDefaultSync(t *testing.T) {
