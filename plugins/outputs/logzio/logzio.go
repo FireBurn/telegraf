@@ -4,6 +4,7 @@ package logzio
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -87,6 +88,11 @@ func (l *Logzio) Close() error {
 
 // Write takes in group of points to be written to the Output
 func (l *Logzio) Write(metrics []telegraf.Metric) error {
+	return l.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes the metrics to logz.io. It can be cancelled via the context.
+func (l *Logzio) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if len(metrics) == 0 {
 		return nil
 	}
@@ -112,16 +118,16 @@ func (l *Logzio) Write(metrics []telegraf.Metric) error {
 		return fmt.Errorf("unable to close gzip: %w", err)
 	}
 
-	return l.send(buff.Bytes())
+	return l.send(ctx, buff.Bytes())
 }
 
-func (l *Logzio) send(metrics []byte) error {
+func (l *Logzio) send(ctx context.Context, metrics []byte) error {
 	url, err := l.authURL()
 	if err != nil {
 		return err
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(metrics))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(metrics))
 	if err != nil {
 		return fmt.Errorf("unable to create http.Request: %w", err)
 	}

@@ -3,6 +3,7 @@ package logzio
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -49,6 +51,38 @@ func TestParseMetric(t *testing.T) {
 		require.Equal(t, logzioType, lm.Type)
 		require.Equal(t, tm.Tags(), lm.Dimensions)
 		require.Equal(t, tm.Time(), lm.Time)
+	}
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	unblock := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	defer close(unblock)
+
+	l := &Logzio{
+		Token: config.NewSecret([]byte(testToken)),
+		URL:   ts.URL,
+		Log:   testutil.Logger{},
+	}
+	require.NoError(t, l.Connect())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- l.WriteContext(ctx, testutil.MockMetrics())
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
 	}
 }
 
