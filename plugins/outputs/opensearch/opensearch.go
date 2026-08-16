@@ -137,7 +137,11 @@ func init() {
 }
 
 func (o *Opensearch) Connect() error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(o.Timeout))
+	return o.ConnectContext(context.Background())
+}
+
+func (o *Opensearch) ConnectContext(parent context.Context) error {
+	ctx, cancel := context.WithTimeout(parent, time.Duration(o.Timeout))
 	defer cancel()
 
 	err := o.newClient()
@@ -228,13 +232,17 @@ func getPointID(m telegraf.Metric) string {
 }
 
 func (o *Opensearch) Write(metrics []telegraf.Metric) error {
+	return o.WriteContext(context.Background(), metrics)
+}
+
+func (o *Opensearch) WriteContext(parent context.Context, metrics []telegraf.Metric) error {
 	// get indexers based on unique pipeline values
 	indexers := getTargetIndexers(metrics, o)
 	if len(indexers) == 0 {
 		return errors.New("failed to instantiate OpenSearch bulkindexer")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(o.Timeout))
+	ctx, cancel := context.WithTimeout(parent, time.Duration(o.Timeout))
 	defer cancel()
 
 	for _, metric := range metrics {

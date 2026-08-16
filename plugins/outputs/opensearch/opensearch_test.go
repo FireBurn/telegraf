@@ -1,6 +1,7 @@
 package opensearch
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -406,4 +407,52 @@ func TestDisconnectedServerOnWrite(t *testing.T) {
 
 	err = e.Write(testutil.MockMetrics())
 	require.Error(t, err)
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	block := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/_bulk":
+			<-block
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			if _, err := w.Write([]byte(`{"version": {"number": "7.8"}}`)); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				t.Error(err)
+			}
+		}
+	}))
+	defer ts.Close()
+	defer close(block)
+
+	urls := []string{"http://" + ts.Listener.Addr().String()}
+
+	e := &Opensearch{
+		URLs:           urls,
+		IndexName:      `{{.Tag "tag1"}}-{{.Time.Format "2006-01-02"}}`,
+		Timeout:        config.Duration(time.Minute),
+		ManageTemplate: false,
+		Log:            testutil.Logger{},
+	}
+	var err error
+	e.indexTmpl, err = template.New("index").Parse(e.IndexName)
+	require.NoError(t, err)
+
+	require.NoError(t, e.Connect())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- e.WriteContext(ctx, testutil.MockMetrics())
+	}()
+
+	cancel()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
 }

@@ -38,6 +38,20 @@ using the `startup_error_behavior` setting. Available values are:
             the plugin in case probing fails. If the plugin does not support
             probing, Telegraf will behave as if `ignore` was set instead.
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds the connection ping/template-management calls made
+during connect and the bulk-indexing requests made during a write.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: OpenSearch may or may not have indexed some or all of the
+documents. Telegraf keeps the batch for retry, so a cancelled write can
+result in duplicate documents.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Configuration
 
 ```toml @sample.conf
