@@ -26,6 +26,22 @@ more details on how to use them.
 
 [SECRETSTORE]: ../../../docs/CONFIGURATION.md#secret-store-secrets
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds Jetstream stream lookup/creation during connect,
+Jetstream publish and acknowledgement calls made during a write. It does not
+bound plain (non-Jetstream) `core NATS` publishes, since those are
+non-blocking, buffered sends with no context parameter.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: NATS/Jetstream may or may not have received and acknowledged some
+or all of the messages. Telegraf keeps the batch for retry, so a cancelled
+write can result in duplicate messages.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Configuration
 
 ```toml @sample.conf

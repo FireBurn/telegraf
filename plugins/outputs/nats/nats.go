@@ -97,6 +97,10 @@ func (n *NATS) SetSerializer(serializer telegraf.Serializer) {
 }
 
 func (n *NATS) Connect() error {
+	return n.ConnectContext(context.Background())
+}
+
+func (n *NATS) ConnectContext(ctx context.Context) error {
 	var err error
 
 	opts := []nats.Option{
@@ -173,7 +177,7 @@ func (n *NATS) Connect() error {
 		}
 
 		if n.Jetstream.DisableStreamCreation {
-			stream, err := n.jetstreamClient.Stream(context.Background(), n.Jetstream.Name)
+			stream, err := n.jetstreamClient.Stream(ctx, n.Jetstream.Name)
 			if err != nil {
 				if errors.Is(err, nats.ErrStreamNotFound) {
 					return fmt.Errorf("stream %q does not exist and disable_stream_creation is true", n.Jetstream.Name)
@@ -184,7 +188,7 @@ func (n *NATS) Connect() error {
 			n.Log.Infof("Connected to existing stream %q with subjects: %v", n.Jetstream.Name, subjects)
 			return nil
 		}
-		_, err = n.jetstreamClient.CreateOrUpdateStream(context.Background(), *n.jetstreamStreamConfig)
+		_, err = n.jetstreamClient.CreateOrUpdateStream(ctx, *n.jetstreamStreamConfig)
 		if err != nil {
 			return fmt.Errorf("failed to create or update stream: %w", err)
 		}
@@ -325,13 +329,13 @@ func (n *NATS) Close() error {
 	return nil
 }
 
-func (n *NATS) publishMessage(sub string, buf []byte) (jetstream.PubAckFuture, error) {
+func (n *NATS) publishMessage(ctx context.Context, sub string, buf []byte) (jetstream.PubAckFuture, error) {
 	if n.Jetstream != nil {
 		if n.Jetstream.AsyncPublish {
 			paf, err := n.jetstreamClient.PublishAsync(sub, buf, jetstream.WithExpectStream(n.Jetstream.Name))
 			return paf, err
 		}
-		_, err := n.jetstreamClient.Publish(context.Background(), sub, buf, jetstream.WithExpectStream(n.Jetstream.Name))
+		_, err := n.jetstreamClient.Publish(ctx, sub, buf, jetstream.WithExpectStream(n.Jetstream.Name))
 		return nil, err
 	}
 	err := n.conn.Publish(sub, buf)
@@ -339,6 +343,10 @@ func (n *NATS) publishMessage(sub string, buf []byte) (jetstream.PubAckFuture, e
 }
 
 func (n *NATS) Write(metrics []telegraf.Metric) error {
+	return n.WriteContext(context.Background(), metrics)
+}
+
+func (n *NATS) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if len(metrics) == 0 {
 		return nil
 	}
@@ -359,7 +367,7 @@ func (n *NATS) Write(metrics []telegraf.Metric) error {
 			n.Log.Debugf("Could not serialize batch of metrics: %v", err)
 			return nil
 		}
-		paf, err := n.publishMessage(n.Subject, buf)
+		paf, err := n.publishMessage(ctx, n.Subject, buf)
 		if err != nil {
 			return fmt.Errorf("failed to send NATS message to subject %q: %w", n.Subject, err)
 		}
@@ -389,7 +397,7 @@ func (n *NATS) Write(metrics []telegraf.Metric) error {
 				continue
 			}
 
-			paf, err := n.publishMessage(sub, buf)
+			paf, err := n.publishMessage(ctx, sub, buf)
 			if err != nil {
 				return fmt.Errorf("failed to send NATS message: %w", err)
 			}
@@ -410,10 +418,14 @@ func (n *NATS) Write(metrics []telegraf.Metric) error {
 					continue
 				case err := <-pafs[i].Err():
 					return fmt.Errorf("publish acknowledgement is an error: %w (retrying)", err)
+				case <-ctx.Done():
+					return ctx.Err()
 				}
 			}
 		case <-time.After(time.Duration(*n.Jetstream.AsyncAckTimeout)):
 			return fmt.Errorf("waiting for acknowledgement timed out, %d messages pending", n.jetstreamClient.PublishAsyncPending())
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 	return nil
