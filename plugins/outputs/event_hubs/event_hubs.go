@@ -70,8 +70,12 @@ func (e *EventHubs) SetSerializer(serializer telegraf.Serializer) {
 }
 
 func (e *EventHubs) Write(metrics []telegraf.Metric) error {
-	ctx := context.Background()
+	return e.WriteContext(context.Background(), metrics)
+}
 
+// WriteContext writes the metrics to Event Hubs, passing ctx through to batch
+// creation and send so a stuck write can be cancelled.
+func (e *EventHubs) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	batchOptions := e.options
 	batches := make(map[string]*azeventhubs.EventDataBatch)
 	for i := 0; i < len(metrics); i++ {
@@ -124,7 +128,7 @@ func (e *EventHubs) Write(metrics []telegraf.Metric) error {
 			e.Log.Tracef("metric: %+v", m)
 			continue
 		}
-		if err := e.send(batches[partition]); err != nil {
+		if err := e.send(ctx, batches[partition]); err != nil {
 			return fmt.Errorf("sending batch for partition %q failed: %w", partition, err)
 		}
 
@@ -142,15 +146,15 @@ func (e *EventHubs) Write(metrics []telegraf.Metric) error {
 		if batch.NumBytes() == 0 {
 			continue
 		}
-		if err := e.send(batch); err != nil {
+		if err := e.send(ctx, batch); err != nil {
 			return fmt.Errorf("sending batch for partition %q failed: %w", partition, err)
 		}
 	}
 	return nil
 }
 
-func (e *EventHubs) send(batch *azeventhubs.EventDataBatch) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(e.Timeout))
+func (e *EventHubs) send(ctx context.Context, batch *azeventhubs.EventDataBatch) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(e.Timeout))
 	defer cancel()
 
 	return e.client.SendEventDataBatch(ctx, batch, nil)
