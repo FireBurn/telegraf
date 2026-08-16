@@ -3,6 +3,7 @@ package influxdb_v2_test
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
 	"math"
@@ -1544,6 +1545,44 @@ func BenchmarkWriteConcurrent100k_8(b *testing.B) {
 		require.NoError(b, plugin.Write(metrics))
 	}
 	b.ReportMetric(float64(batchsize*b.N)/b.Elapsed().Seconds(), "metrics/s")
+}
+
+func TestWriteContextReturnsPromptlyOnCancellation(t *testing.T) {
+	unblock := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-unblock:
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+	defer close(unblock)
+
+	plugin := &influxdb.InfluxDB{
+		URLs:            []string{"http://" + ts.Listener.Addr().String()},
+		Bucket:          "telegraf",
+		ContentEncoding: "identity",
+		Timeout:         config.Duration(time.Minute),
+		Log:             &testutil.Logger{},
+	}
+	require.NoError(t, plugin.Init())
+	require.NoError(t, plugin.Connect())
+	defer plugin.Close()
+
+	metrics := []telegraf.Metric{
+		metric.New("cpu", map[string]string{}, map[string]interface{}{"value": 42.0}, time.Unix(0, 0)),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := plugin.WriteContext(ctx, metrics)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	require.Less(t, elapsed, 5*time.Second)
 }
 
 func BenchmarkWriteConcurrent100k_16(b *testing.B) {
