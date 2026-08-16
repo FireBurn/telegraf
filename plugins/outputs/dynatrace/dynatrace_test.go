@@ -1,6 +1,7 @@
 package dynatrace
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -223,6 +224,48 @@ func TestSendMetrics(t *testing.T) {
 	require.NoError(t, d.Init())
 	require.NoError(t, d.Connect())
 	require.NoError(t, d.Write(metrics))
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	unblock := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	defer close(unblock)
+
+	d := &Dynatrace{
+		URL:      ts.URL,
+		APIToken: config.NewSecret([]byte("123")),
+		Log:      testutil.Logger{},
+	}
+	require.NoError(t, d.Init())
+	require.NoError(t, d.Connect())
+
+	metrics := []telegraf.Metric{
+		metric.New(
+			"simple_metric",
+			map[string]string{},
+			map[string]interface{}{"value": float64(3.14)},
+			time.Date(2010, time.November, 10, 23, 0, 0, 0, time.UTC),
+		),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- d.WriteContext(ctx, metrics)
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorContains(t, err, "context canceled")
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
 }
 
 func TestSendMetricsWithPatterns(t *testing.T) {

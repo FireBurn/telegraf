@@ -3,6 +3,7 @@ package dynatrace
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -63,6 +64,10 @@ func (d *Dynatrace) Close() error {
 }
 
 func (d *Dynatrace) Write(metrics []telegraf.Metric) error {
+	return d.WriteContext(context.Background(), metrics)
+}
+
+func (d *Dynatrace) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if len(metrics) == 0 {
 		return nil
 	}
@@ -136,7 +141,7 @@ func (d *Dynatrace) Write(metrics []telegraf.Metric) error {
 
 		output := strings.Join(batch, "\n")
 		if output != "" {
-			if err := d.send(output); err != nil {
+			if err := d.send(ctx, output); err != nil {
 				return fmt.Errorf("error processing data: %w", err)
 			}
 		}
@@ -145,9 +150,9 @@ func (d *Dynatrace) Write(metrics []telegraf.Metric) error {
 	return nil
 }
 
-func (d *Dynatrace) send(msg string) error {
+func (d *Dynatrace) send(ctx context.Context, msg string) error {
 	var err error
-	req, err := http.NewRequest("POST", d.URL, bytes.NewBufferString(msg))
+	req, err := http.NewRequestWithContext(ctx, "POST", d.URL, bytes.NewBufferString(msg))
 	if err != nil {
 		d.Log.Errorf("Dynatrace error: %s", err.Error())
 		return fmt.Errorf("error while creating HTTP request: %w", err)
