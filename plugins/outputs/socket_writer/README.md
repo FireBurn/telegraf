@@ -34,6 +34,23 @@ using the `startup_error_behavior` setting. Available values are:
             the plugin in case probing fails. If the plugin does not support
             probing, Telegraf will behave as if `ignore` was set instead.
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds both connecting/dialing and the outbound network
+write. On cancellation, the underlying connection is closed (or, for vsock,
+whose dial has no context support, the in-progress dial is abandoned and
+closed in the background if it eventually completes) and Telegraf reconnects
+on the next write.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: the destination may or may not have received some or all of the
+metrics. Telegraf keeps the batch for retry, so a cancelled write can result
+in duplicate metrics.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Configuration
 
 ```toml @sample.conf

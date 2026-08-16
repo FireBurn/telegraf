@@ -2,6 +2,7 @@ package socket_writer
 
 import (
 	"bufio"
+	"context"
 	"net"
 	"runtime"
 	"sync"
@@ -204,6 +205,57 @@ func TestSocketWriter_Write_reconnect(t *testing.T) {
 	n, err := lconn.Read(buf)
 	require.NoError(t, err)
 	require.Equal(t, string(mbsout), string(buf[:n]))
+}
+
+// enteredConn signals when a Write has actually reached the connection, so
+// cancellation tests never have to guess the timing with a sleep.
+type enteredConn struct {
+	net.Conn
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (c *enteredConn) Write(b []byte) (int, error) {
+	c.once.Do(func() { close(c.entered) })
+	return c.Conn.Write(b)
+}
+
+func TestWriteContextCancelUnblocksBlockedWrite(t *testing.T) {
+	// net.Pipe is fully synchronous: a Write blocks until the peer Reads,
+	// giving a deterministic (non-timing-dependent) blocked write.
+	client, server := net.Pipe()
+	defer server.Close()
+	blocked := &enteredConn{Conn: client, entered: make(chan struct{})}
+
+	sw := newSocketWriter(t, "tcp://ignored:0")
+	encoder, err := internal.NewContentEncoder("")
+	require.NoError(t, err)
+	sw.encoder = encoder
+	sw.Conn = blocked
+	sw.Log = testutil.Logger{}
+
+	metrics := []telegraf.Metric{testutil.TestMetric(1, "testblock")}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sw.WriteContext(ctx, metrics)
+	}()
+
+	// Cancel only once the write has actually reached the blocked connection.
+	<-blocked.entered
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("WriteContext did not return promptly after context cancellation")
+	}
+
+	// The connection must be dropped so the next write reconnects rather
+	// than reusing a poisoned one.
+	require.Nil(t, sw.Conn)
 }
 
 func TestSocketWriter_udp_gzip(t *testing.T) {

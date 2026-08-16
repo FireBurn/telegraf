@@ -2,6 +2,7 @@
 package socket_writer
 
 import (
+	"context"
 	"crypto/tls"
 	_ "embed"
 	"errors"
@@ -47,6 +48,14 @@ func (sw *SocketWriter) SetSerializer(s telegraf.Serializer) {
 }
 
 func (sw *SocketWriter) Connect() error {
+	return sw.ConnectContext(context.Background())
+}
+
+// ConnectContext dials the socket, aborting the dial/handshake when ctx is
+// cancelled. vsock has no context-aware dial API, so that path races the
+// blocking call in a goroutine and abandons it on cancellation, closing any
+// connection it eventually produces.
+func (sw *SocketWriter) ConnectContext(ctx context.Context) error {
 	spl := strings.SplitN(sw.Address, "://", 2)
 	if len(spl) != 2 {
 		return fmt.Errorf("invalid address: %s", sw.Address)
@@ -83,12 +92,34 @@ func (sw *SocketWriter) Connect() error {
 		if (port >= uint64(math.Pow(2, 32))-1) && (port <= 0) {
 			return fmt.Errorf("port number %d is out of range", port)
 		}
-		c, sockErr = vsock.Dial(uint32(cid), uint32(port), nil)
+
+		type dialResult struct {
+			conn net.Conn
+			err  error
+		}
+		resultCh := make(chan dialResult, 1)
+		go func() {
+			conn, err := vsock.Dial(uint32(cid), uint32(port), nil)
+			resultCh <- dialResult{conn, err}
+		}()
+		select {
+		case res := <-resultCh:
+			c, sockErr = res.conn, res.err
+		case <-ctx.Done():
+			go func() {
+				if res := <-resultCh; res.conn != nil {
+					res.conn.Close()
+				}
+			}()
+			return ctx.Err()
+		}
 	} else {
+		d := net.Dialer{}
 		if tlsCfg == nil {
-			c, sockErr = net.Dial(spl[0], spl[1])
+			c, sockErr = d.DialContext(ctx, spl[0], spl[1])
 		} else {
-			c, sockErr = tls.Dial(spl[0], spl[1], tlsCfg)
+			tlsDialer := &tls.Dialer{NetDialer: &d, Config: tlsCfg}
+			c, sockErr = tlsDialer.DialContext(ctx, spl[0], spl[1])
 		}
 	}
 
@@ -133,12 +164,26 @@ func (sw *SocketWriter) setKeepAlive(c net.Conn) error {
 // If an error is encountered, it is up to the caller to retry the same write again later.
 // Not parallel safe.
 func (sw *SocketWriter) Write(metrics []telegraf.Metric) error {
+	return sw.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes the given metrics to the destination, aborting an
+// in-flight write via a forced deadline when ctx is cancelled. net.Conn has
+// no native context support.
+func (sw *SocketWriter) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if sw.Conn == nil {
 		// previous write failed with permanent error and socket was closed.
-		if err := sw.Connect(); err != nil {
+		if err := sw.ConnectContext(ctx); err != nil {
 			return err
 		}
 	}
+
+	// Capture the connection the watcher is allowed to touch. Re-reading
+	// sw.Conn from the watcher would race the error path below, which closes
+	// the connection and may install a replacement.
+	conn := sw.Conn
+	stop := internal.CancelConnOnContext(ctx, conn)
+	defer stop()
 
 	for _, m := range metrics {
 		bs, err := sw.serializer.Serialize(m)
@@ -153,17 +198,27 @@ func (sw *SocketWriter) Write(metrics []telegraf.Metric) error {
 			continue
 		}
 
-		if _, err := sw.Conn.Write(bs); err != nil {
+		if _, err := conn.Write(bs); err != nil {
 			// TODO log & keep going with remaining strings
 			var netErr net.Error
 			if errors.As(err, &netErr) {
 				// permanent error. close the connection
+				stop()
 				sw.Close()
-				sw.Conn = nil
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
 				return fmt.Errorf("closing connection: %w", netErr)
 			}
 			return err
 		}
+	}
+
+	// A cancellation that raced the last successful write leaves the socket
+	// with an expired deadline, which would fail every later write. Drop it.
+	if stop() {
+		sw.Close()
+		return ctx.Err()
 	}
 
 	return nil
