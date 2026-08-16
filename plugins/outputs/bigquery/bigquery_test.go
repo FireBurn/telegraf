@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"google.golang.org/api/option"
 	"google.golang.org/api/option/internaloption"
 
+	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/testutil"
 )
 
@@ -177,6 +179,52 @@ func TestWrite(t *testing.T) {
 	require.Equal(t, mockMetrics[0].Tags()["tag1"], row.Tag1)
 	require.Equal(t, mockMetrics[0].Time(), pt)
 	require.InDelta(t, mockMetrics[0].Fields()["value"], row.Value, testutil.DefaultDelta)
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	var reached atomic.Bool
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/projects/test-project/datasets/test-dataset/tables/test1/insertAll" {
+			reached.Store(true)
+			<-release
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("{}"))
+	}))
+	// Defers run LIFO: release the blocked handler before closing the
+	// server, otherwise srv.Close() would itself hang waiting for it.
+	defer srv.Close()
+	defer close(release)
+
+	b := &BigQuery{
+		Project: "test-project",
+		Dataset: "test-dataset",
+		// Long enough that only context cancellation, not the insert timeout, ends the write.
+		Timeout: config.Duration(time.Minute),
+		Log:     testutil.Logger{},
+	}
+
+	require.NoError(t, b.Init())
+	require.NoError(t, b.setUpTestClient(srv.URL))
+	require.NoError(t, b.Connect())
+
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() { result <- b.WriteContext(ctx, testutil.MockMetrics()) }()
+
+	require.Eventually(t, reached.Load, time.Second, time.Millisecond)
+	cancel()
+
+	select {
+	case <-result:
+		// WriteContext logs the per-table error and always returns nil; the
+		// assertion here is that it returned promptly rather than hanging
+		// for the full one-minute insert timeout, verified by the deadline below.
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
 }
 
 func TestWriteCompact(t *testing.T) {

@@ -66,19 +66,24 @@ func (b *BigQuery) Init() error {
 }
 
 func (b *BigQuery) Connect() error {
+	return b.ConnectContext(context.Background())
+}
+
+// ConnectContext connects to BigQuery, passing ctx through to client setup and
+// the compact-table existence check so a stuck connection attempt can be cancelled.
+func (b *BigQuery) ConnectContext(ctx context.Context) error {
 	if b.client == nil {
-		if err := b.setUpDefaultClient(); err != nil {
+		if err := b.setUpDefaultClient(ctx); err != nil {
 			return err
 		}
 	}
 
 	if b.CompactTable != "" {
-		ctx := context.Background()
-		ctx, cancel := context.WithTimeout(ctx, time.Duration(b.Timeout))
+		checkCtx, cancel := context.WithTimeout(ctx, time.Duration(b.Timeout))
 		defer cancel()
 
 		// Check if the compact table exists
-		_, err := b.client.Dataset(b.Dataset).Table(b.CompactTable).Metadata(ctx)
+		_, err := b.client.Dataset(b.Dataset).Table(b.CompactTable).Metadata(checkCtx)
 		if err != nil {
 			return fmt.Errorf("compact table: %w", err)
 		}
@@ -86,13 +91,11 @@ func (b *BigQuery) Connect() error {
 	return nil
 }
 
-func (b *BigQuery) setUpDefaultClient() error {
+func (b *BigQuery) setUpDefaultClient(ctx context.Context) error {
 	var credentialsOption option.ClientOption
 
 	// https://cloud.google.com/go/docs/reference/cloud.google.com/go/0.94.1#hdr-Timeouts_and_Cancellation
 	// Do not attempt to add timeout to this context for the bigquery client.
-	ctx := context.Background()
-
 	if b.CredentialsFile != "" {
 		credType, err := common_gcp.ParseCredentialType(b.CredentialsFile)
 		if err != nil {
@@ -119,8 +122,14 @@ func (b *BigQuery) setUpDefaultClient() error {
 
 // Write the metrics to Google Cloud BigQuery.
 func (b *BigQuery) Write(metrics []telegraf.Metric) error {
+	return b.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes the metrics to Google Cloud BigQuery, passing ctx through
+// to the underlying insert calls so a stuck write can be cancelled.
+func (b *BigQuery) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if b.CompactTable != "" {
-		return b.writeCompact(metrics)
+		return b.writeCompact(ctx, metrics)
 	}
 
 	groupedMetrics := groupByMetricName(metrics)
@@ -131,7 +140,7 @@ func (b *BigQuery) Write(metrics []telegraf.Metric) error {
 		wg.Add(1)
 		go func(k string, v []bigquery.ValueSaver) {
 			defer wg.Done()
-			b.insertToTable(k, v)
+			b.insertToTable(ctx, k, v)
 		}(k, v)
 	}
 
@@ -140,8 +149,7 @@ func (b *BigQuery) Write(metrics []telegraf.Metric) error {
 	return nil
 }
 
-func (b *BigQuery) writeCompact(metrics []telegraf.Metric) error {
-	ctx := context.Background()
+func (b *BigQuery) writeCompact(ctx context.Context, metrics []telegraf.Metric) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(b.Timeout))
 	defer cancel()
 
@@ -281,8 +289,7 @@ func valueToBqType(v interface{}) bigquery.FieldType {
 	}
 }
 
-func (b *BigQuery) insertToTable(metricName string, metrics []bigquery.ValueSaver) {
-	ctx := context.Background()
+func (b *BigQuery) insertToTable(ctx context.Context, metricName string, metrics []bigquery.ValueSaver) {
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(b.Timeout))
 	defer cancel()
 

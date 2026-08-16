@@ -94,6 +94,19 @@ with the following schema:
 ]
 ```
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds client setup, the compact-table existence check, and
+the BigQuery insert call(s) made for one write.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: BigQuery may or may not have applied the insert. Telegraf keeps the
+batch for retry, so a cancelled write can result in duplicate rows.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Restrictions
 
 Avoid hyphens on BigQuery tables, underlying SDK cannot handle streaming inserts
