@@ -4,6 +4,7 @@ package sumologic
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -113,6 +114,10 @@ func (*SumoLogic) Close() error {
 }
 
 func (s *SumoLogic) Write(metrics []telegraf.Metric) error {
+	return s.WriteContext(context.Background(), metrics)
+}
+
+func (s *SumoLogic) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if s.serializer == nil {
 		return errors.New("sumologic: serializer unset")
 	}
@@ -131,22 +136,22 @@ func (s *SumoLogic) Write(metrics []telegraf.Metric) error {
 			return err
 		}
 
-		return s.writeRequestChunks(chunks)
+		return s.writeRequestChunks(ctx, chunks)
 	}
 
-	return s.writeRequestChunk(reqBody)
+	return s.writeRequestChunk(ctx, reqBody)
 }
 
-func (s *SumoLogic) writeRequestChunks(chunks [][]byte) error {
+func (s *SumoLogic) writeRequestChunks(ctx context.Context, chunks [][]byte) error {
 	for _, reqChunk := range chunks {
-		if err := s.writeRequestChunk(reqChunk); err != nil {
+		if err := s.writeRequestChunk(ctx, reqChunk); err != nil {
 			s.Log.Errorf("Error sending chunk: %v", err)
 		}
 	}
 	return nil
 }
 
-func (s *SumoLogic) writeRequestChunk(reqBody []byte) error {
+func (s *SumoLogic) writeRequestChunk(ctx context.Context, reqBody []byte) error {
 	var (
 		err  error
 		buff bytes.Buffer
@@ -161,7 +166,7 @@ func (s *SumoLogic) writeRequestChunk(reqBody []byte) error {
 		return err
 	}
 
-	req, err := http.NewRequest(defaultMethod, s.URL, &buff)
+	req, err := http.NewRequestWithContext(ctx, defaultMethod, s.URL, &buff)
 	if err != nil {
 		return err
 	}

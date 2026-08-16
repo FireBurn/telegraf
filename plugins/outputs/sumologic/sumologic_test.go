@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -693,6 +694,44 @@ func TestTryingToSendEmptyMetricsDoesntFail(t *testing.T) {
 
 	err = plugin.Write(metrics)
 	require.NoError(t, err)
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	unblock := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	defer close(unblock)
+
+	u, err := url.Parse("http://" + ts.Listener.Addr().String())
+	require.NoError(t, err)
+
+	plugin := Default()
+	plugin.URL = u.String()
+
+	serializer := &carbon2.Serializer{
+		Format: "field_separate",
+	}
+	require.NoError(t, serializer.Init())
+	plugin.SetSerializer(serializer)
+	require.NoError(t, plugin.Connect())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- plugin.WriteContext(ctx, []telegraf.Metric{getMetric()})
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
 }
 
 func countLines(t *testing.T, body io.Reader) int {

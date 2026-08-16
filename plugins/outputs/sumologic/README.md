@@ -76,3 +76,20 @@ plugin ordering. See [CONFIGURATION.md][CONFIGURATION.md] for more details.
   ## Custom dimensions will allow you to query your metrics at a more granular level.
   # dimensions = ""
 ```
+
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds each outbound HTTP request made during a write,
+including the individual chunk requests issued when the serialized batch
+exceeds `max_request_body_size`. Note that when a batch is split into
+chunks, an error (including a cancellation) on an individual chunk request
+is only logged and does not fail the overall write.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: the destination may or may not have received the metrics. Telegraf
+keeps the batch for retry, so a cancelled write can result in duplicate
+metrics.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
