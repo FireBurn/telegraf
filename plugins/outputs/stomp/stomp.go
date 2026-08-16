@@ -2,6 +2,7 @@
 package stomp
 
 import (
+	"context"
 	"crypto/tls"
 	_ "embed"
 	"fmt"
@@ -38,36 +39,78 @@ type STOMP struct {
 }
 
 func (q *STOMP) Connect() error {
-	tlsConfig, err := q.ClientConfig.TLSConfig()
-	if err != nil {
-		return err
-	}
-	if tlsConfig != nil {
-		q.conn, err = tls.Dial("tcp", q.Host, tlsConfig)
-		if err != nil {
-			return err
-		}
-	} else {
-		q.conn, err = net.Dial("tcp", q.Host)
-		if err != nil {
-			return err
-		}
-	}
+	return q.ConnectContext(context.Background())
+}
 
-	authOption, err := q.getAuthOption()
-	if err != nil {
-		return err
+// ConnectContext dials and performs the STOMP handshake, returning early
+// if ctx is cancelled. Neither net.Dial/tls.Dial nor stomp.Connect accept
+// a context, so ConnectContext races the whole dial+handshake in a
+// goroutine and abandons it on cancellation, disconnecting/closing
+// whatever it eventually produces.
+func (q *STOMP) ConnectContext(ctx context.Context) error {
+	type connectResult struct {
+		conn  net.Conn
+		stomp *stomp.Conn
+		err   error
 	}
-	heartbeatOption := stomp.ConnOpt.HeartBeat(
-		time.Duration(q.HeartBeatSend),
-		time.Duration(q.HeartBeatRec),
-	)
-	q.stomp, err = stomp.Connect(q.conn, heartbeatOption, authOption)
-	if err != nil {
-		return err
+	resultCh := make(chan connectResult, 1)
+	go func() {
+		tlsConfig, err := q.ClientConfig.TLSConfig()
+		if err != nil {
+			resultCh <- connectResult{err: err}
+			return
+		}
+
+		var conn net.Conn
+		if tlsConfig != nil {
+			conn, err = tls.Dial("tcp", q.Host, tlsConfig)
+		} else {
+			conn, err = net.Dial("tcp", q.Host)
+		}
+		if err != nil {
+			resultCh <- connectResult{err: err}
+			return
+		}
+
+		authOption, err := q.getAuthOption()
+		if err != nil {
+			conn.Close()
+			resultCh <- connectResult{err: err}
+			return
+		}
+		heartbeatOption := stomp.ConnOpt.HeartBeat(
+			time.Duration(q.HeartBeatSend),
+			time.Duration(q.HeartBeatRec),
+		)
+		sc, err := stomp.Connect(conn, heartbeatOption, authOption)
+		if err != nil {
+			conn.Close()
+			resultCh <- connectResult{err: err}
+			return
+		}
+		resultCh <- connectResult{conn: conn, stomp: sc}
+	}()
+
+	select {
+	case res := <-resultCh:
+		if res.err != nil {
+			return res.err
+		}
+		q.conn = res.conn
+		q.stomp = res.stomp
+		q.Log.Debug("STOMP Connected...")
+		return nil
+	case <-ctx.Done():
+		go func() {
+			res := <-resultCh
+			if res.stomp != nil {
+				res.stomp.Disconnect()
+			} else if res.conn != nil {
+				res.conn.Close()
+			}
+		}()
+		return ctx.Err()
 	}
-	q.Log.Debug("STOMP Connected...")
-	return nil
 }
 
 func (q *STOMP) SetSerializer(serializer telegraf.Serializer) {
@@ -75,15 +118,55 @@ func (q *STOMP) SetSerializer(serializer telegraf.Serializer) {
 }
 
 func (q *STOMP) Write(metrics []telegraf.Metric) error {
+	return q.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext sends metrics via STOMP, returning early if ctx is
+// cancelled. stomp.Conn.Send has no context support and can block
+// indefinitely pushing to the connection's internal write channel if its
+// background writer goroutine is stuck, while holding the connection's
+// internal lock for the whole blocked call -- so a cancelled send leaves
+// the connection unsafe to reuse. Each send is raced in a goroutine;
+// on cancellation the connection is detached (closed in the background
+// once the abandoned send returns) so the next write reconnects instead
+// of blocking behind that lock.
+func (q *STOMP) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
+	if q.stomp == nil {
+		if err := q.ConnectContext(ctx); err != nil {
+			return err
+		}
+	}
+
 	for _, metric := range metrics {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		values, err := q.serialize.Serialize(metric)
 		if err != nil {
 			q.Log.Errorf("Serializing metric %v failed: %s", metric, err)
 			continue
 		}
-		err = q.stomp.Send(q.QueueName, "text/plain", values, nil)
-		if err != nil {
-			return fmt.Errorf("sending metric failed: %w", err)
+
+		sc := q.stomp
+		done := make(chan error, 1)
+		go func() {
+			done <- sc.Send(q.QueueName, "text/plain", values, nil)
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				return fmt.Errorf("sending metric failed: %w", err)
+			}
+		case <-ctx.Done():
+			q.stomp = nil
+			q.conn = nil
+			go func() {
+				<-done
+				sc.Disconnect()
+			}()
+			return ctx.Err()
 		}
 	}
 	return nil
@@ -92,6 +175,9 @@ func (*STOMP) SampleConfig() string {
 	return sampleConfig
 }
 func (q *STOMP) Close() error {
+	if q.stomp == nil {
+		return nil
+	}
 	return q.stomp.Disconnect()
 }
 
