@@ -3,7 +3,6 @@ package sql
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -174,7 +173,7 @@ func TestWriteContextReturnsPromptlyOnCancellation(t *testing.T) {
 
 	m := stableMetric(
 		"cpu",
-		[]telegraf.Tag{},
+		make([]telegraf.Tag, 0),
 		[]telegraf.Field{{Key: "value", Value: 42.0}},
 		time.Unix(0, 0),
 	)
@@ -191,7 +190,7 @@ func TestWriteContextReturnsPromptlyOnCancellation(t *testing.T) {
 	elapsed := time.Since(start)
 
 	require.Error(t, err)
-	require.True(t, errors.Is(err, context.Canceled), "expected a context.Canceled error, got: %v", err)
+	require.ErrorIs(t, err, context.Canceled, "expected a context.Canceled error, got: %v", err)
 	require.Less(t, elapsed, 5*time.Second)
 
 	// A normal write with a live context still works afterward.

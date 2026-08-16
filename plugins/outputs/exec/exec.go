@@ -152,7 +152,9 @@ func (c *CommandRunner) Run(ctx context.Context, timeout time.Duration, command,
 		// waiting to observe a clean shutdown) and reap it in the
 		// background so this call can return immediately.
 		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
+			if err := cmd.Process.Kill(); err != nil && c.log != nil {
+				c.log.Debugf("Killing abandoned process failed: %v", err)
+			}
 		}
 		go func() { <-done }()
 		return ctx.Err()

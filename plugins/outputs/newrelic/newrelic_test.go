@@ -5,7 +5,6 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -164,7 +163,7 @@ func TestWriteContextCancellation(t *testing.T) {
 	select {
 	case err := <-errCh:
 		require.Error(t, err)
-		require.True(t, strings.Contains(err.Error(), "context canceled"), "expected error to mention context cancellation, got: %v", err)
+		require.Contains(t, err.Error(), "context canceled", "expected error to mention context cancellation, got: %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("WriteContext did not return after context cancellation")
 	}

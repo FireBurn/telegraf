@@ -44,7 +44,7 @@ const (
 type ioTDBSession interface {
 	Open(enableRPCCompression bool, connectionTimeoutInMs int) error
 	Close() error
-	InsertRecords(deviceIds []string, measurements [][]string, dataTypes [][]client.TSDataType, values [][]interface{}, timestamps []int64) error
+	InsertRecords(deviceIDs []string, measurements [][]string, dataTypes [][]client.TSDataType, values [][]interface{}, timestamps []int64) error
 }
 
 type IoTDB struct {
@@ -213,7 +213,8 @@ func (s *IoTDB) acquireSession(ctx context.Context) (ioTDBSession, uint64, error
 	}
 	if s.poisoned >= maxPoisonedSessions {
 		if !s.limitLogged {
-			s.Log.Errorf("IoTDB session replacement limit reached; refusing to create another session because previous sessions may still be in use by an abandoned call")
+			s.Log.Errorf("IoTDB session replacement limit reached; refusing to create another session " +
+				"because previous sessions may still be in use by an abandoned call")
 			s.limitLogged = true
 		}
 		s.sessionMu.Unlock()
@@ -464,7 +465,8 @@ func (s *IoTDB) abandonSession(session ioTDBSession, generation uint64, callDone
 	s.poisoned++
 	s.sessionMu.Unlock()
 
-	s.Log.Warnf("Abandoning IoTDB session after write cancellation; the underlying call may still be running against the stale session and will be closed once it returns")
+	s.Log.Warnf("Abandoning IoTDB session after write cancellation; the underlying call may still be " +
+		"running against the stale session and will be closed once it returns")
 
 	go func() {
 		// Wait for the original, still in-flight call to finish on its own

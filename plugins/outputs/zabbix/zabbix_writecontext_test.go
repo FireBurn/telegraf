@@ -29,11 +29,11 @@ func (s *blockingZabbixSender) Send(*zabbix.Packet) (zabbix.Response, error) {
 	return zabbix.Response{}, nil
 }
 
-func (*blockingZabbixSender) SendMetrics([]*zabbix.Metric) (zabbix.Response, zabbix.Response, error) {
+func (*blockingZabbixSender) SendMetrics([]*zabbix.Metric) (resActive, resTrapper zabbix.Response, err error) {
 	return zabbix.Response{}, zabbix.Response{}, nil
 }
 
-func (*blockingZabbixSender) RegisterHost(string, string) error {
+func (*blockingZabbixSender) RegisterHost(_, _ string) error {
 	return nil
 }
 

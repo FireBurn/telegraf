@@ -34,8 +34,8 @@ func TestWriteContextCancelReturnsPromptly(t *testing.T) {
 	}()
 
 	r := &Riemann{
-		URL:     "tcp://" + listener.Addr().String(),
-		Log:     testutil.Logger{},
+		URL: "tcp://" + listener.Addr().String(),
+		Log: testutil.Logger{},
 		// Timeout=0 disables raidman's own SetDeadline call, so the test
 		// exercises Telegraf's context-based cancellation rather than
 		// racing raidman's internal timeout.

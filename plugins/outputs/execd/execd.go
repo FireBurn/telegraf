@@ -35,7 +35,7 @@ type Execd struct {
 	// the subprocess's stdin pipe. A write acquires it before writing and
 	// returns it once the write to stdin returns. If a write is abandoned
 	// because its ctx was cancelled while stdin.Write was still blocked
-	// (see writeContext), the token is only returned once that abandoned
+	// (see writePipeContext), the token is only returned once that abandoned
 	// write eventually completes - so a genuinely wedged subprocess causes
 	// every subsequent write to fail the same way (fail fast on their own
 	// ctx) rather than piling up concurrent writers on the same pipe.
@@ -103,7 +103,7 @@ func (e *Execd) Write(metrics []telegraf.Metric) error {
 // cancelled write would be a much bigger behavior change than this
 // conversion is meant to make (see plugin README). Instead, each write to
 // the pipe races against ctx and is abandoned (but left running in the
-// background) on cancellation. See writeContext for what abandonment means
+// background) on cancellation. See writePipeContext for what abandonment means
 // for subsequent writes.
 func (e *Execd) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if err := ctx.Err(); err != nil {
@@ -115,7 +115,7 @@ func (e *Execd) WriteContext(ctx context.Context, metrics []telegraf.Metric) err
 		if err != nil {
 			return fmt.Errorf("error serializing metrics: %w", err)
 		}
-		return e.writeContext(ctx, b)
+		return e.writePipeContext(ctx, b)
 	}
 	for _, m := range metrics {
 		if err := ctx.Err(); err != nil {
@@ -131,14 +131,14 @@ func (e *Execd) WriteContext(ctx context.Context, metrics []telegraf.Metric) err
 			continue
 		}
 
-		if err := e.writeContext(ctx, b); err != nil {
+		if err := e.writePipeContext(ctx, b); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// writeContext writes b to the subprocess's stdin, racing the pipe write
+// writePipeContext writes b to the subprocess's stdin, racing the pipe write
 // against ctx cancellation per the goroutine-race-and-abandon pattern in
 // docs/specs/tsd-012-output-context-aware-write.md. A pipe write can block
 // indefinitely if the subprocess is alive but stuck/deadlocked and not
@@ -156,7 +156,7 @@ func (e *Execd) WriteContext(ctx context.Context, metrics []telegraf.Metric) err
 // internal/process.Process's restart-on-exit logic if the subprocess dies
 // outright. Cancellation here does not fix a wedged subprocess; it only
 // stops Telegraf from blocking forever on it.
-func (e *Execd) writeContext(ctx context.Context, b []byte) error {
+func (e *Execd) writePipeContext(ctx context.Context, b []byte) error {
 	select {
 	case <-e.writeSem:
 	case <-ctx.Done():

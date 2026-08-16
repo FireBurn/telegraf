@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/influxdata/telegraf"
@@ -155,10 +156,10 @@ func TestWriteContextCancellation(t *testing.T) {
 					ExpiresIn:   123,
 				}
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")
-				require.NoError(t, json.NewEncoder(w).Encode(token))
+				assert.NoError(t, json.NewEncoder(w).Encode(token))
 			} else if strings.HasSuffix(r.URL.Path, "/folder") {
 				_, err := io.WriteString(w, "folder1")
-				require.NoError(t, err)
+				assert.NoError(t, err)
 			}
 			w.WriteHeader(http.StatusOK)
 		}),

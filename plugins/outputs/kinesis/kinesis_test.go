@@ -449,7 +449,9 @@ type blockingKinesisPutRecords struct {
 	release chan struct{}
 }
 
-func (m *blockingKinesisPutRecords) PutRecords(ctx context.Context, _ *kinesis.PutRecordsInput, _ ...func(*kinesis.Options)) (*kinesis.PutRecordsOutput, error) {
+func (m *blockingKinesisPutRecords) PutRecords(
+	ctx context.Context, _ *kinesis.PutRecordsInput, _ ...func(*kinesis.Options),
+) (*kinesis.PutRecordsOutput, error) {
 	m.reached <- struct{}{}
 	select {
 	case <-ctx.Done():

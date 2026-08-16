@@ -353,7 +353,7 @@ func TestWriteContextCancellation(t *testing.T) {
 	t.Setenv("AZURE_PASSWORD", "fake")
 
 	unblock := make(chan struct{})
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		<-unblock
 		w.WriteHeader(http.StatusOK)
 	}))

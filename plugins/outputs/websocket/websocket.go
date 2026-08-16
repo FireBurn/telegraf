@@ -115,14 +115,21 @@ func (w *WebSocket) ConnectContext(ctx context.Context) error {
 	}
 
 	type result struct {
-		conn *ws.Conn
-		resp *http.Response
-		err  error
+		conn       *ws.Conn
+		statusCode int
+		err        error
 	}
 	resultCh := make(chan result, 1)
 	go func() {
 		conn, resp, err := dialer.DialContext(ctx, w.URL, headers)
-		resultCh <- result{conn, resp, err}
+		// gorilla can return a non-nil response (e.g. a non-101 status) even
+		// on a handshake failure; the caller owns closing its body either way.
+		statusCode := 0
+		if resp != nil {
+			statusCode = resp.StatusCode
+			_ = resp.Body.Close()
+		}
+		resultCh <- result{conn, statusCode, err}
 	}()
 
 	select {
@@ -130,9 +137,8 @@ func (w *WebSocket) ConnectContext(ctx context.Context) error {
 		if res.err != nil {
 			return fmt.Errorf("error dial: %w", res.err)
 		}
-		_ = res.resp.Body.Close()
-		if res.resp.StatusCode != http.StatusSwitchingProtocols {
-			return fmt.Errorf("wrong status code while connecting to server: %d", res.resp.StatusCode)
+		if res.statusCode != http.StatusSwitchingProtocols {
+			return fmt.Errorf("wrong status code while connecting to server: %d", res.statusCode)
 		}
 		w.conn = res.conn
 		go w.read(res.conn)

@@ -20,7 +20,7 @@ type fakeFabric struct {
 
 func (*fakeFabric) Connect() error { return nil }
 func (*fakeFabric) Close() error   { return nil }
-func (*fakeFabric) Write(metrics []telegraf.Metric) error {
+func (*fakeFabric) Write(_ []telegraf.Metric) error {
 	return nil
 }
 func (f *fakeFabric) WriteContext(ctx context.Context, _ []telegraf.Metric) error {

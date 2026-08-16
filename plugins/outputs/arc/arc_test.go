@@ -273,7 +273,7 @@ func TestWriteContextCancellation(t *testing.T) {
 	blockCh := make(chan struct{})
 	defer close(blockCh)
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		select {
 		case <-blockCh:
 		case <-r.Context().Done():

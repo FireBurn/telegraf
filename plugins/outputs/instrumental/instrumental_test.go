@@ -34,7 +34,8 @@ func TestConnectContextCancelUnblocksAuth(t *testing.T) {
 		defer conn.Close()
 		// Drain the hello/auth lines but never send a response.
 		buf := make([]byte, 512)
-		_, _ = conn.Read(buf)
+		//nolint:errcheck // best-effort drain in a test helper; nothing to act on
+		conn.Read(buf)
 	}()
 
 	port := tcpServer.Addr().(*net.TCPAddr).Port

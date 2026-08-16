@@ -44,7 +44,7 @@ func (bt *blockingTopic) Publish(context.Context, *pubsub.Message) publishResult
 	bt.reached.Store(true)
 	return &blockingResult{release: bt.release}
 }
-func (*blockingTopic) PublishSettings() pubsub.PublishSettings { return pubsub.PublishSettings{} }
+func (*blockingTopic) PublishSettings() pubsub.PublishSettings   { return pubsub.PublishSettings{} }
 func (*blockingTopic) SetPublishSettings(pubsub.PublishSettings) {}
 
 func TestPubSub_WriteContextCancellation(t *testing.T) {

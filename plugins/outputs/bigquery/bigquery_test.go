@@ -191,7 +191,9 @@ func TestWriteContextCancellation(t *testing.T) {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("{}"))
+		if _, err := w.Write([]byte("{}")); err != nil {
+			return
+		}
 	}))
 	// Defers run LIFO: release the blocked handler before closing the
 	// server, otherwise srv.Close() would itself hang waiting for it.

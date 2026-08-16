@@ -229,7 +229,7 @@ func (q *Quix) newProducer() (sarama.SyncProducer, error) {
 		return nil, errors.New("no brokers received")
 	}
 
-	cfg, err := q.buildSaramaConfig(quixConfig)
+	cfg, err := buildSaramaConfig(quixConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +237,7 @@ func (q *Quix) newProducer() (sarama.SyncProducer, error) {
 	return q.producerFunc(brokers, cfg)
 }
 
-func (q *Quix) buildSaramaConfig(quixConfig *brokerConfig) (*sarama.Config, error) {
+func buildSaramaConfig(quixConfig *brokerConfig) (*sarama.Config, error) {
 	cfg := sarama.NewConfig()
 	cfg.Producer.Return.Successes = true
 
