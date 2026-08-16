@@ -42,6 +42,10 @@ func (r *RedisTimeSeries) Init() error {
 }
 
 func (r *RedisTimeSeries) Connect() error {
+	return r.ConnectContext(context.Background())
+}
+
+func (r *RedisTimeSeries) ConnectContext(parent context.Context) error {
 	if r.Address == "" {
 		return errors.New("redis address must be specified")
 	}
@@ -64,7 +68,7 @@ func (r *RedisTimeSeries) Connect() error {
 		Password: password.String(),
 		DB:       r.Database,
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.Timeout))
+	ctx, cancel := context.WithTimeout(parent, time.Duration(r.Timeout))
 	defer cancel()
 	return r.client.Ping(ctx).Err()
 }
@@ -81,7 +85,11 @@ func (*RedisTimeSeries) SampleConfig() string {
 	return sampleConfig
 }
 func (r *RedisTimeSeries) Write(metrics []telegraf.Metric) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.Timeout))
+	return r.WriteContext(context.Background(), metrics)
+}
+
+func (r *RedisTimeSeries) WriteContext(parent context.Context, metrics []telegraf.Metric) error {
+	ctx, cancel := context.WithTimeout(parent, time.Duration(r.Timeout))
 	defer cancel()
 
 	for _, m := range metrics {

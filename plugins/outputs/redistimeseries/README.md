@@ -25,6 +25,20 @@ to use them.
 
 [SECRETSTORE]: ../../../docs/CONFIGURATION.md#secret-store-secrets
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds the connection ping made during connect and the
+Redis commands issued during a write.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: Redis may or may not have applied some or all of the commands.
+Telegraf keeps the batch for retry, so a cancelled write can result in
+duplicate points.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Configuration
 
 ```toml @sample.conf

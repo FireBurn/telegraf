@@ -3,6 +3,7 @@ package redistimeseries
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,6 +42,52 @@ func TestConnectAndWriteIntegration(t *testing.T) {
 	require.NoError(t, redis.Connect())
 	// Verify that we can successfully write data to the RedisTimeSeries server
 	require.NoError(t, redis.Write(testutil.MockMetrics()))
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	// A bare listener that accepts the connection but never replies to the
+	// RESP commands the client sends, so PING/TS.ADD block until the
+	// context is cancelled.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	accepted := make(chan struct{})
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			close(accepted)
+			<-context.Background().Done() // keep the connection open, never respond
+			conn.Close()
+		}
+	}()
+
+	plugin := &RedisTimeSeries{
+		Address: ln.Addr().String(),
+		Timeout: config.Duration(time.Minute),
+		Log:     testutil.Logger{},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- plugin.ConnectContext(ctx)
+	}()
+
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never saw a connection attempt")
+	}
+
+	cancel()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ConnectContext did not return after context cancellation")
+	}
 }
 
 func TestCases(t *testing.T) {
