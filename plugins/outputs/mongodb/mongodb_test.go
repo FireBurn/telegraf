@@ -1,6 +1,7 @@
 package mongodb
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -126,6 +127,31 @@ func TestInitFail(t *testing.T) {
 			require.ErrorContains(t, plugin.Init(), tt.expected)
 		})
 	}
+}
+
+// TestConnectContextReturnsPromptlyOnCancellation verifies ConnectContext
+// propagates the caller's context instead of ignoring it: it points at a
+// non-routable address (RFC 5737 TEST-NET-1) with a driver-side timeout far
+// longer than the context deadline, so a passing test proves the context
+// deadline - not the driver's own timeout - is what stopped the call.
+func TestConnectContextReturnsPromptlyOnCancellation(t *testing.T) {
+	plugin := &MongoDB{
+		Dsn:                "mongodb://192.0.2.1:27017/?connectTimeoutMS=60000&serverSelectionTimeoutMS=60000",
+		AuthenticationType: "NONE",
+		MetricDatabase:     "telegraf_test",
+		MetricGranularity:  "seconds",
+	}
+	require.NoError(t, plugin.Init())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := plugin.ConnectContext(ctx)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	require.Less(t, elapsed, 5*time.Second)
 }
 
 func TestConnectAndWriteNoAuthIntegration(t *testing.T) {

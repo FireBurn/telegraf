@@ -204,8 +204,12 @@ func (s *MongoDB) Init() error {
 }
 
 func (s *MongoDB) Connect() error {
-	// Connect to the database
-	ctx := context.Background()
+	return s.ConnectContext(context.Background())
+}
+
+// ConnectContext connects to the database, passing ctx through to the
+// underlying mongo client and the initial collection listing.
+func (s *MongoDB) ConnectContext(ctx context.Context) error {
 	client, err := mongo.Connect(ctx, s.options)
 	if err != nil {
 		return fmt.Errorf("connecting to server failed: %w", err)
@@ -240,8 +244,12 @@ func (s *MongoDB) Connect() error {
 }
 
 func (s *MongoDB) Write(metrics []telegraf.Metric) error {
-	ctx := context.Background()
+	return s.WriteContext(context.Background(), metrics)
+}
 
+// WriteContext writes metrics to MongoDB, passing ctx through to the
+// underlying client so a write can be cancelled/bounded.
+func (s *MongoDB) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if s.WriteBatch {
 		return s.writeBatch(ctx, metrics)
 	}
