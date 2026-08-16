@@ -2,6 +2,7 @@ package execd
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -125,6 +126,59 @@ func TestBatchOutputWorks(t *testing.T) {
 	require.NoError(t, e.Write([]telegraf.Metric{m, m2}))
 	require.NoError(t, e.Close())
 	wg.Wait()
+}
+
+// blockingWriteCloser is a fake stdin pipe that blocks on Write until
+// unblock is closed, standing in for a subprocess that is alive but stuck
+// and not consuming stdin. It lets the cancellation test below be
+// deterministic instead of racing a real subprocess against a hang.
+type blockingWriteCloser struct {
+	unblock chan struct{}
+}
+
+func (w *blockingWriteCloser) Write(p []byte) (int, error) {
+	<-w.unblock
+	return len(p), nil
+}
+
+func (*blockingWriteCloser) Close() error {
+	return nil
+}
+
+func TestWriteContextReturnsOnCancel(t *testing.T) {
+	serializer := &serializers_influx.Serializer{}
+	require.NoError(t, serializer.Init())
+
+	e := &Execd{
+		Command:      []string{"unused"},
+		RestartDelay: config.Duration(5 * time.Second),
+		serializer:   serializer,
+		Log:          testutil.Logger{},
+	}
+	require.NoError(t, e.Init())
+
+	// Stand in for a stuck subprocess without spawning a real process:
+	// stdin.Write blocks until the test unblocks it.
+	unblock := make(chan struct{})
+	e.process.Stdin = &blockingWriteCloser{unblock: unblock}
+	defer close(unblock) // let the abandoned write finish so it doesn't leak past the test
+
+	m := metric.New(
+		"cpu",
+		map[string]string{"name": "cpu1"},
+		map[string]interface{}{"idle": 50, "sys": 30},
+		now,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := e.WriteContext(ctx, []telegraf.Metric{m})
+	elapsed := time.Since(start)
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, elapsed, 2*time.Second, "WriteContext should return promptly once the context is cancelled")
 }
 
 func TestPartiallyUnserializableThrowError(t *testing.T) {

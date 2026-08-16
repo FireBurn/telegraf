@@ -22,6 +22,28 @@ plugin ordering. See [CONFIGURATION.md][CONFIGURATION.md] for more details.
 
 [CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. It
+bounds how long a single write to the subprocess's `stdin` pipe is allowed
+to block, which matters when the subprocess is alive but stuck/deadlocked
+and not consuming its input, so the pipe write never returns on its own.
+
+Unlike some other context-aware outputs, cancellation here does **not** kill
+or restart the subprocess - execd is meant to keep a single long-running
+process across writes, and doing otherwise would be a much bigger behavior
+change. On cancellation, only the pending write to `stdin` is abandoned: it
+keeps running against the pipe in the background, and the subprocess itself
+is left completely untouched. Abandoning a write is not a fix for a wedged
+subprocess: if it is genuinely stuck, every subsequent write will time out
+the same way until the subprocess starts consuming `stdin` again on its own,
+or it exits and is restarted by `restart_delay`. `write_timeout` bounds how
+long Telegraf blocks on a stuck write; it does not detect or recover a
+wedged subprocess.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Configuration
 
 ```toml @sample.conf
