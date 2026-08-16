@@ -2,6 +2,7 @@ package exec
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"strings"
@@ -25,7 +26,7 @@ type MockRunner struct {
 }
 
 // Run runs the command.
-func (c *MockRunner) Run(_ time.Duration, _, _ []string, buffer io.Reader) error {
+func (c *MockRunner) Run(_ context.Context, _ time.Duration, _, _ []string, buffer io.Reader) error {
 	parser := parsers_influx.NewStreamParser(buffer)
 	numMetrics := 0
 
@@ -95,6 +96,57 @@ func TestExternalOutputNoBatch(t *testing.T) {
 	// Make sure it executed the command twice, both with a single metric
 	require.Equal(t, []int{1, 1}, runner.runs)
 	require.NoError(t, e.Close())
+}
+
+// blockingRunner is a Runner that blocks until either unblock is closed or
+// ctx is cancelled, mirroring how CommandRunner races a subprocess against
+// ctx cancellation. It lets tests assert WriteContext returns promptly on
+// cancellation without racing a real subprocess or a wall-clock sleep.
+type blockingRunner struct {
+	unblock chan struct{}
+}
+
+func (r *blockingRunner) Run(ctx context.Context, _ time.Duration, _, _ []string, _ io.Reader) error {
+	select {
+	case <-r.unblock:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestWriteContextReturnsOnCancel(t *testing.T) {
+	serializer := &influx.Serializer{}
+	require.NoError(t, serializer.Init())
+
+	runner := &blockingRunner{unblock: make(chan struct{})}
+	// Let the still-running mock "command" finish after the test asserts,
+	// so nothing is left blocked once the test returns.
+	defer close(runner.unblock)
+
+	e := &Exec{
+		UseBatchFormat: true,
+		serializer:     serializer,
+		Log:            testutil.Logger{},
+		runner:         runner,
+	}
+
+	m := metric.New(
+		"cpu",
+		map[string]string{"name": "cpu1"},
+		map[string]interface{}{"idle": 50, "sys": 30},
+		now,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := e.WriteContext(ctx, []telegraf.Metric{m})
+	elapsed := time.Since(start)
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, elapsed, 2*time.Second, "WriteContext should return promptly once the context is cancelled")
 }
 
 func TestExec(t *testing.T) {

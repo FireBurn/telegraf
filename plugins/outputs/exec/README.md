@@ -24,6 +24,20 @@ plugin ordering. See [CONFIGURATION.md][CONFIGURATION.md] for more details.
 
 [CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. It
+bounds how long a single write attempt (one subprocess invocation, or one
+metric's worth of invocations when `use_batch_format` is `false`) is allowed
+to run in addition to the plugin's own `timeout` setting. If `write_timeout`
+elapses first, the subprocess is killed immediately (skipping the normal
+SIGTERM-then-SIGKILL grace period used by `timeout`) and reaped in the
+background so the write call returns promptly; any metrics not yet sent to a
+subprocess when cancellation happens are not written.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Configuration
 
 ```toml @sample.conf

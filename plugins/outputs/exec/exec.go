@@ -3,6 +3,7 @@ package exec
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -62,6 +63,17 @@ func (*Exec) Close() error {
 
 // Write writes the metrics to the configured command.
 func (e *Exec) Write(metrics []telegraf.Metric) error {
+	return e.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes the metrics to the configured command. It returns
+// promptly once ctx is cancelled: the in-flight subprocess (if any) is
+// killed and reaped in the background rather than being waited on.
+func (e *Exec) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	var buffer bytes.Buffer
 	if e.UseBatchFormat {
 		serializedMetrics, err := e.serializer.SerializeBatch(metrics)
@@ -74,10 +86,15 @@ func (e *Exec) Write(metrics []telegraf.Metric) error {
 			return nil
 		}
 
-		return e.runner.Run(time.Duration(e.Timeout), e.Command, e.Environment, &buffer)
+		return e.runner.Run(ctx, time.Duration(e.Timeout), e.Command, e.Environment, &buffer)
 	}
 	errs := make([]error, 0, len(metrics))
 	for _, metric := range metrics {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
+
 		serializedMetric, err := e.serializer.Serialize(metric)
 		if err != nil {
 			return err
@@ -85,7 +102,7 @@ func (e *Exec) Write(metrics []telegraf.Metric) error {
 		buffer.Reset()
 		buffer.Write(serializedMetric)
 
-		err = e.runner.Run(time.Duration(e.Timeout), e.Command, e.Environment, &buffer)
+		err = e.runner.Run(ctx, time.Duration(e.Timeout), e.Command, e.Environment, &buffer)
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
@@ -93,7 +110,7 @@ func (e *Exec) Write(metrics []telegraf.Metric) error {
 
 // Runner provides an interface for running exec.Cmd.
 type Runner interface {
-	Run(time.Duration, []string, []string, io.Reader) error
+	Run(ctx context.Context, timeout time.Duration, command, environment []string, buffer io.Reader) error
 }
 
 // CommandRunner runs a command with the ability to kill the process before the timeout.
@@ -102,8 +119,13 @@ type CommandRunner struct {
 	log telegraf.Logger
 }
 
-// Run runs the command.
-func (c *CommandRunner) Run(timeout time.Duration, command, environments []string, buffer io.Reader) error {
+// Run runs the command, bounded both by the plugin's own configured
+// timeout (which sends SIGTERM then SIGKILL after a grace period, see
+// internal.WaitTimeout) and by ctx. If ctx is cancelled first, the process
+// is killed outright and reaped in a background goroutine so Run returns
+// promptly without waiting for it; the caller's ctx.Err() is returned in
+// that case instead of an internal-timeout error.
+func (c *CommandRunner) Run(ctx context.Context, timeout time.Duration, command, environments []string, buffer io.Reader) error {
 	cmd := exec.Command(command[0], command[1:]...)
 	if len(environments) > 0 {
 		cmd.Env = append(os.Environ(), environments...)
@@ -112,7 +134,29 @@ func (c *CommandRunner) Run(timeout time.Duration, command, environments []strin
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	err := internal.RunTimeout(cmd, timeout)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- internal.WaitTimeout(cmd, timeout)
+	}()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		// The caller is no longer waiting; kill the process outright
+		// (skipping the internal SIGTERM grace period, since nothing is
+		// waiting to observe a clean shutdown) and reap it in the
+		// background so this call can return immediately.
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		go func() { <-done }()
+		return ctx.Err()
+	}
 	s := stderr
 
 	if err != nil {
