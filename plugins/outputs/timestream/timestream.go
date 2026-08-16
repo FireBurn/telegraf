@@ -113,6 +113,15 @@ func (*Timestream) SampleConfig() string {
 }
 
 func (t *Timestream) Connect() error {
+	return t.ConnectContext(context.Background())
+}
+
+// ConnectContext connects to Timestream, passing ctx through to the optional
+// database describe check so a stuck connection attempt can be cancelled.
+// Client construction itself (WriteFactory) still uses an internal
+// background context, matching the one-time, non-per-request nature of that
+// call.
+func (t *Timestream) ConnectContext(ctx context.Context) error {
 	if t.DatabaseName == "" {
 		return errors.New("'database_name' key is required")
 	}
@@ -187,7 +196,7 @@ func (t *Timestream) Connect() error {
 		describeDatabaseInput := &timestreamwrite.DescribeDatabaseInput{
 			DatabaseName: aws.String(t.DatabaseName),
 		}
-		describeDatabaseOutput, err := svc.DescribeDatabase(context.Background(), describeDatabaseInput)
+		describeDatabaseOutput, err := svc.DescribeDatabase(ctx, describeDatabaseInput)
 		if err != nil {
 			t.Log.Errorf("Couldn't describe database %q. Check error, fix permissions, connectivity, create database.", t.DatabaseName)
 			return err
@@ -210,6 +219,12 @@ func init() {
 }
 
 func (t *Timestream) Write(metrics []telegraf.Metric) error {
+	return t.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes the metrics to Timestream, passing ctx through to the
+// underlying WriteRecords/CreateTable calls so a stuck write can be cancelled.
+func (t *Timestream) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	writeRecordsInputs := t.TransformMetrics(metrics)
 
 	maxWriteJobs := t.MaxWriteGoRoutinesCount
@@ -230,7 +245,7 @@ func (t *Timestream) Write(metrics []telegraf.Metric) error {
 		go func() {
 			defer wg.Done()
 			for writeJob := range writeJobs {
-				if err := t.writeToTimestream(writeJob, true); err != nil {
+				if err := t.writeToTimestream(ctx, writeJob, true); err != nil {
 					errs <- err
 				}
 			}
@@ -263,8 +278,8 @@ func (t *Timestream) Write(metrics []telegraf.Metric) error {
 	return nil
 }
 
-func (t *Timestream) writeToTimestream(writeRecordsInput *timestreamwrite.WriteRecordsInput, resourceNotFoundRetry bool) error {
-	_, err := t.svc.WriteRecords(context.Background(), writeRecordsInput)
+func (t *Timestream) writeToTimestream(ctx context.Context, writeRecordsInput *timestreamwrite.WriteRecordsInput, resourceNotFoundRetry bool) error {
+	_, err := t.svc.WriteRecords(ctx, writeRecordsInput)
 	if err != nil {
 		// Telegraf will retry ingesting the metrics if an error is returned from the plugin.
 		// Therefore, return error only for retryable exceptions: ThrottlingException and 5xx exceptions.
@@ -273,7 +288,7 @@ func (t *Timestream) writeToTimestream(writeRecordsInput *timestreamwrite.WriteR
 			if resourceNotFoundRetry {
 				t.Log.Warnf("Failed to write to Timestream database %q table %q: %s",
 					t.DatabaseName, *writeRecordsInput.TableName, notFound)
-				return t.createTableAndRetry(writeRecordsInput)
+				return t.createTableAndRetry(ctx, writeRecordsInput)
 			}
 			t.logWriteToTimestreamError(notFound, writeRecordsInput.TableName)
 			// log error and return error to telegraf to retry in next flush interval
@@ -318,17 +333,17 @@ func (t *Timestream) logWriteToTimestreamError(err error, tableName *string) {
 		t.DatabaseName, *tableName, err.Error())
 }
 
-func (t *Timestream) createTableAndRetry(writeRecordsInput *timestreamwrite.WriteRecordsInput) error {
+func (t *Timestream) createTableAndRetry(ctx context.Context, writeRecordsInput *timestreamwrite.WriteRecordsInput) error {
 	if t.CreateTableIfNotExists {
 		t.Log.Infof(
 			"Trying to create table %q in database %q, as 'CreateTableIfNotExists' config key is 'true'.",
 			*writeRecordsInput.TableName,
 			t.DatabaseName,
 		)
-		err := t.createTable(writeRecordsInput.TableName)
+		err := t.createTable(ctx, writeRecordsInput.TableName)
 		if err == nil {
 			t.Log.Infof("Table %q in database %q created. Retrying writing.", *writeRecordsInput.TableName, t.DatabaseName)
-			return t.writeToTimestream(writeRecordsInput, false)
+			return t.writeToTimestream(ctx, writeRecordsInput, false)
 		}
 		t.Log.Errorf("Failed to create table %q in database %q: %s. Skipping metric!", *writeRecordsInput.TableName, t.DatabaseName, err.Error())
 	} else {
@@ -339,7 +354,7 @@ func (t *Timestream) createTableAndRetry(writeRecordsInput *timestreamwrite.Writ
 }
 
 // createTable creates a Timestream table according to the configuration.
-func (t *Timestream) createTable(tableName *string) error {
+func (t *Timestream) createTable(ctx context.Context, tableName *string) error {
 	createTableInput := &timestreamwrite.CreateTableInput{
 		DatabaseName: aws.String(t.DatabaseName),
 		TableName:    aws.String(*tableName),
@@ -357,7 +372,7 @@ func (t *Timestream) createTable(tableName *string) error {
 	}
 	createTableInput.Tags = tags
 
-	_, err := t.svc.CreateTable(context.Background(), createTableInput)
+	_, err := t.svc.CreateTable(ctx, createTableInput)
 	if err != nil {
 		var e *types.ConflictException
 		if errors.As(err, &e) {

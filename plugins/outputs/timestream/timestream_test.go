@@ -69,6 +69,90 @@ func (*mockTimestreamClient) DescribeDatabase(
 	return nil, errors.New("hello from DescribeDatabase")
 }
 
+// blockingTimestreamClient blocks in WriteRecords until its context is
+// cancelled or release is closed, used to verify WriteContext returns
+// promptly on cancellation.
+type blockingTimestreamClient struct {
+	reached chan struct{}
+	release chan struct{}
+}
+
+func (*blockingTimestreamClient) CreateTable(
+	context.Context,
+	*timestreamwrite.CreateTableInput,
+	...func(*timestreamwrite.Options),
+) (*timestreamwrite.CreateTableOutput, error) {
+	return nil, nil
+}
+
+func (b *blockingTimestreamClient) WriteRecords(
+	ctx context.Context,
+	_ *timestreamwrite.WriteRecordsInput,
+	_ ...func(*timestreamwrite.Options),
+) (*timestreamwrite.WriteRecordsOutput, error) {
+	b.reached <- struct{}{}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-b.release:
+		return &timestreamwrite.WriteRecordsOutput{}, nil
+	}
+}
+
+func (*blockingTimestreamClient) DescribeDatabase(
+	context.Context,
+	*timestreamwrite.DescribeDatabaseInput,
+	...func(*timestreamwrite.Options),
+) (*timestreamwrite.DescribeDatabaseOutput, error) {
+	return nil, nil
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	originalWriteFactory := WriteFactory
+	t.Cleanup(func() { WriteFactory = originalWriteFactory })
+
+	svc := &blockingTimestreamClient{reached: make(chan struct{}, 1), release: make(chan struct{})}
+	defer close(svc.release)
+
+	WriteFactory = func(*common_aws.CredentialConfig) (WriteClient, error) {
+		return svc, nil
+	}
+
+	plugin := Timestream{
+		MappingMode:     MappingModeSingleTable,
+		SingleTableName: testSingleTableName,
+		SingleTableDimensionNameForTelegrafMeasurementName: testSingleTableDim,
+		DatabaseName: tsDBName,
+		Log:          testutil.Logger{},
+	}
+	require.NoError(t, plugin.Connect())
+
+	m := metric.New(
+		"metricName1",
+		map[string]string{"tag1": "value1"},
+		map[string]interface{}{"value_supported1": float64(10)},
+		time1,
+	)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() { result <- plugin.WriteContext(ctx, []telegraf.Metric{m}) }()
+
+	select {
+	case <-svc.reached:
+	case <-time.After(time.Second):
+		t.Fatal("WriteRecords was not called")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		require.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
+}
+
 func TestConnectValidatesConfigParameters(t *testing.T) {
 	originalWriteFactory := WriteFactory
 	t.Cleanup(func() {
