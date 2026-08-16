@@ -3,6 +3,7 @@ package arc
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -266,6 +267,50 @@ func TestWriteServerError(t *testing.T) {
 	}
 
 	require.ErrorContains(t, plugin.Write(metrics), "returned status 500")
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	blockCh := make(chan struct{})
+	defer close(blockCh)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-blockCh:
+		case <-r.Context().Done():
+		}
+	}))
+	defer ts.Close()
+
+	plugin := &Arc{
+		URL:              ts.URL,
+		HTTPClientConfig: common_http.HTTPClientConfig{Timeout: config.Duration(time.Minute)},
+		Log:              testutil.Logger{},
+	}
+
+	require.NoError(t, plugin.Init())
+	require.NoError(t, plugin.Connect())
+
+	metrics := []telegraf.Metric{
+		metric.New(
+			"cpu",
+			map[string]string{"host": "server01"},
+			map[string]interface{}{"usage_idle": float64(95.5)},
+			time.Now(),
+		),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- plugin.WriteContext(ctx, metrics) }()
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return promptly after context cancellation")
+	}
 }
 
 func TestMessagePackEncoding(t *testing.T) {

@@ -59,8 +59,12 @@ func (a *Arc) Init() error {
 }
 
 func (a *Arc) Connect() error {
-	ctx, cancel := context.WithCancel(context.Background())
-	client, err := a.HTTPClientConfig.CreateClient(ctx, a.Log)
+	return a.ConnectContext(context.Background())
+}
+
+func (a *Arc) ConnectContext(ctx context.Context) error {
+	clientCtx, cancel := context.WithCancel(ctx)
+	client, err := a.HTTPClientConfig.CreateClient(clientCtx, a.Log)
 	if err != nil {
 		cancel()
 		return fmt.Errorf("failed to create HTTP client: %w", err)
@@ -82,6 +86,10 @@ func (a *Arc) Close() error {
 }
 
 func (a *Arc) Write(metrics []telegraf.Metric) error {
+	return a.WriteContext(context.Background(), metrics)
+}
+
+func (a *Arc) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if len(metrics) == 0 {
 		return nil
 	}
@@ -148,10 +156,10 @@ func (a *Arc) Write(metrics []telegraf.Metric) error {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(a.Timeout))
+	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(a.Timeout))
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", a.URL, &payload)
+	req, err := http.NewRequestWithContext(reqCtx, "POST", a.URL, &payload)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
