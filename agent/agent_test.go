@@ -331,6 +331,30 @@ func TestConnectOutputCancellation(t *testing.T) {
 	require.ErrorIs(t, <-result, context.Canceled)
 }
 
+// TestConnectOutputAttemptBoundsByWriteTimeout proves a single connection
+// attempt is itself bounded by write_timeout, not just reconnects performed
+// mid-write (flushOnce/flushBatch already covered that case). Without this,
+// a plugin whose ConnectContext hangs (e.g. a wedged broker dial) could block
+// startup indefinitely regardless of a configured write_timeout. This tests
+// connectOutputAttempt directly rather than connectOutput, since the latter's
+// own 15s retry-sleep on failure would otherwise dominate the test runtime.
+func TestConnectOutputAttemptBoundsByWriteTimeout(t *testing.T) {
+	plugin := &connectContextOutput{entered: make(chan struct{})}
+	output, err := models.NewRunningOutput(
+		plugin,
+		&models.OutputConfig{Name: "test", WriteTimeout: 25 * time.Millisecond},
+		5, 10,
+	)
+	require.NoError(t, err)
+
+	start := time.Now()
+	// No external cancellation: context.Background() never expires on its
+	// own, so a bounded return here can only come from write_timeout.
+	err = connectOutputAttempt(context.Background(), output)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, time.Since(start), 500*time.Millisecond)
+}
+
 type legacyOutput struct{}
 
 func (*legacyOutput) Connect() error                { return nil }

@@ -809,19 +809,37 @@ func (a *Agent) startOutputs(
 // connectOutput connects to all outputs.
 func (*Agent) connectOutput(ctx context.Context, output *models.RunningOutput) error {
 	log.Printf("D! [agent] Attempting connection to [%s]", output.LogName())
-	if err := output.ConnectContext(ctx); err != nil {
+	if err := connectOutputAttempt(ctx, output); err != nil {
 		log.Printf("E! [agent] Failed to connect to [%s], retrying in 15s, error was %q", output.LogName(), err)
 
 		if err := internal.SleepContext(ctx, 15*time.Second); err != nil {
 			return err
 		}
 
-		if err = output.ConnectContext(ctx); err != nil {
+		if err = connectOutputAttempt(ctx, output); err != nil {
 			return fmt.Errorf("error connecting to output %q: %w", output.LogName(), err)
 		}
 	}
 	log.Printf("D! [agent] Successfully connected to %s", output.LogName())
 	return nil
+}
+
+// connectOutputAttempt runs a single ConnectContext attempt, bounded by the
+// output's configured write_timeout when set. write_timeout is documented as
+// covering "producer (re)creation", but that previously only held true for
+// reconnects performed mid-write (see flushOnce/flushBatch); the initial
+// startup connection went out on the bare agent run context and could hang
+// indefinitely regardless of write_timeout. Each retry in connectOutput gets
+// its own fresh deadline by calling this again, rather than sharing one
+// timeout across both attempts and the 15s sleep between them.
+func connectOutputAttempt(ctx context.Context, output *models.RunningOutput) error {
+	if output.Config.WriteTimeout <= 0 {
+		return output.ConnectContext(ctx)
+	}
+
+	connectCtx, cancel := context.WithTimeout(ctx, output.Config.WriteTimeout)
+	defer cancel()
+	return output.ConnectContext(connectCtx)
 }
 
 // runOutputs begins processing metrics and returns until the source channel is
