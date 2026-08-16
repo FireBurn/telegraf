@@ -1,6 +1,7 @@
 package amqp
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -18,7 +19,7 @@ type MockClient struct {
 	CloseCallCount   int
 }
 
-func (c *MockClient) Publish(string, []byte) error {
+func (c *MockClient) Publish(context.Context, string, []byte) error {
 	c.PublishCallCount++
 	return c.PublishF()
 }

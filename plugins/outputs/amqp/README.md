@@ -143,3 +143,20 @@ If you want to use a proxy, you need to set `use_proxy = true`. This will
 use the system's proxy settings to determine the proxy URL. If you need to
 specify a proxy URL manually, you can do so by using `proxy_url`, overriding
 the system settings.
+
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds a single connect-and-publish attempt: dialing the
+broker and declaring the exchange (if not already connected) plus publishing
+a routing-key batch to the channel. Each distinct routing key in a batch is
+published as a separate attempt, so `write_timeout` bounds each of those
+attempts individually rather than the whole `Write` call.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: the destination may or may not have received the metrics. Telegraf
+keeps the batch for retry, so a cancelled write can result in duplicate
+metrics.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins

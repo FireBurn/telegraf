@@ -3,6 +3,7 @@ package amqp
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -71,7 +72,7 @@ type AMQP struct {
 }
 
 type Client interface {
-	Publish(key string, body []byte) error
+	Publish(ctx context.Context, key string, body []byte) error
 	Close() error
 }
 
@@ -99,9 +100,40 @@ func (q *AMQP) Init() error {
 }
 
 func (q *AMQP) Connect() error {
-	var err error
-	q.client, err = q.connect(q.config)
-	return err
+	return q.ConnectContext(context.Background())
+}
+
+// ConnectContext dials the broker and declares the exchange, returning early
+// if ctx is cancelled. amqp091-go's DialConfig has no context-aware variant,
+// so the whole connect is raced in a goroutine and abandoned on
+// cancellation, closing whatever connection it eventually produces.
+func (q *AMQP) ConnectContext(ctx context.Context) error {
+	type result struct {
+		client Client
+		err    error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		c, err := q.connect(q.config)
+		resultCh <- result{c, err}
+	}()
+
+	select {
+	case res := <-resultCh:
+		if res.err != nil {
+			return res.err
+		}
+		q.client = res.client
+		return nil
+	case <-ctx.Done():
+		go func() {
+			res := <-resultCh
+			if res.client != nil {
+				res.client.Close()
+			}
+		}()
+		return ctx.Err()
+	}
 }
 
 func (q *AMQP) Close() error {
@@ -122,6 +154,12 @@ func (q *AMQP) routingKey(metric telegraf.Metric) string {
 }
 
 func (q *AMQP) Write(metrics []telegraf.Metric) error {
+	return q.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext publishes the batches to the broker, returning early if ctx
+// is cancelled.
+func (q *AMQP) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	batches := make(map[string][]telegraf.Metric)
 	if q.ExchangeType == "header" {
 		// Since the routing_key is ignored for this exchange type send as a
@@ -150,16 +188,25 @@ func (q *AMQP) Write(metrics []telegraf.Metric) error {
 			return err
 		}
 
-		err = q.publish(key, body)
+		err = q.publish(ctx, key, body)
 		if err != nil {
+			// A cancelled context always takes precedence: report the
+			// cancellation rather than retrying or swallowing the error.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+
 			// If this is the first attempt to publish and the connection is
 			// closed, try to reconnect and retry once.
 
 			var aerr *amqp.Error
 			if first && errors.As(err, &aerr) && errors.Is(aerr, amqp.ErrClosed) {
 				q.client = nil
-				err := q.publish(key, body)
+				err := q.publish(ctx, key, body)
 				if err != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return ctxErr
+					}
 					return err
 				}
 			} else if q.client != nil {
@@ -173,7 +220,7 @@ func (q *AMQP) Write(metrics []telegraf.Metric) error {
 		first = false
 	}
 
-	if q.sentMessages >= q.MaxMessages && q.MaxMessages > 0 {
+	if q.sentMessages >= q.MaxMessages && q.MaxMessages > 0 && q.client != nil {
 		q.Log.Debug("Sent MaxMessages; closing connection")
 		if err := q.client.Close(); err != nil {
 			q.Log.Errorf("Closing connection failed: %v", err)
@@ -184,22 +231,54 @@ func (q *AMQP) Write(metrics []telegraf.Metric) error {
 	return nil
 }
 
-func (q *AMQP) publish(key string, body []byte) error {
+func (q *AMQP) publish(ctx context.Context, key string, body []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	if q.client == nil {
-		client, err := q.connect(q.config)
-		if err != nil {
+		if err := q.ConnectContext(ctx); err != nil {
 			return err
 		}
 		q.sentMessages = 0
-		q.client = client
 	}
 
-	err := q.client.Publish(key, body)
-	if err != nil {
+	if err := q.publishClient(ctx, q.client, key, body); err != nil {
 		return err
 	}
 	q.sentMessages++
 	return nil
+}
+
+// publishClient races client.Publish against ctx cancellation. amqp091-go's
+// PublishWithContext only checks ctx.Err() up front before calling the
+// blocking Publish -- it does not itself abort a write already in flight to
+// a broker with, e.g., a full TCP send buffer -- so the whole call is raced
+// here. On cancellation the client's delivery state is unknown (it may be
+// mid-write) so it is detached from the plugin and closed in the background
+// once the abandoned call returns; the next write reconnects instead of
+// reusing it.
+func (q *AMQP) publishClient(ctx context.Context, client Client, key string, body []byte) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Publish(ctx, key, body)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		q.client = nil
+		go func() {
+			if err := <-done; err != nil {
+				q.Log.Debugf("Publish on abandoned connection failed: %v", err)
+			}
+			if err := client.Close(); err != nil {
+				q.Log.Errorf("Error closing cancelled connection: %v", err)
+			}
+		}()
+		return ctx.Err()
+	}
 }
 
 func (q *AMQP) serialize(metrics []telegraf.Metric) ([]byte, error) {
