@@ -1,6 +1,7 @@
 package cratedb
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -37,6 +38,32 @@ func createTestContainer(t *testing.T) *testutil.Container {
 	require.NoError(t, err, "failed to start container")
 
 	return &container
+}
+
+// TestWriteContextReturnsPromptlyOnCancellation verifies WriteContext
+// propagates the caller's context instead of ignoring it: it points at a
+// non-routable address (RFC 5737 TEST-NET-1) with the plugin's own Timeout
+// set far longer than the context deadline, so a passing test proves the
+// context deadline - not the plugin's own timeout - is what stopped the
+// call. No Docker container needed.
+func TestWriteContextReturnsPromptlyOnCancellation(t *testing.T) {
+	plugin := &CrateDB{
+		URL:     "postgres://user:pass@192.0.2.1:5432/doc?sslmode=disable",
+		Table:   "metrics",
+		Timeout: config.Duration(60 * time.Second),
+	}
+	require.NoError(t, plugin.Init())
+	require.NoError(t, plugin.Connect())
+
+	callCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := plugin.WriteContext(callCtx, testutil.MockMetrics())
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	require.Less(t, elapsed, 5*time.Second)
 }
 
 func TestConnectAndWriteIntegration(t *testing.T) {

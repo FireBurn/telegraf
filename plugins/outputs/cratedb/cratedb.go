@@ -65,6 +65,13 @@ func (c *CrateDB) Init() error {
 }
 
 func (c *CrateDB) Connect() error {
+	return c.ConnectContext(context.Background())
+}
+
+// ConnectContext opens the database connection and, if configured, creates
+// the target table, bounding the create call by both ctx and the plugin's
+// own timeout setting.
+func (c *CrateDB) ConnectContext(ctx context.Context) error {
 	if c.db == nil {
 		db, err := sql.Open("pgx", c.URL)
 		if err != nil {
@@ -74,7 +81,7 @@ func (c *CrateDB) Connect() error {
 	}
 
 	if c.TableCreate {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.Timeout))
+		ctx, cancel := context.WithTimeout(ctx, time.Duration(c.Timeout))
 		defer cancel()
 
 		query := fmt.Sprintf(tableCreationQuery, c.Table)
@@ -87,7 +94,13 @@ func (c *CrateDB) Connect() error {
 }
 
 func (c *CrateDB) Write(metrics []telegraf.Metric) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.Timeout))
+	return c.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes metrics to CrateDB, bounding the insert by both ctx
+// and the plugin's own timeout setting.
+func (c *CrateDB) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(c.Timeout))
 	defer cancel()
 
 	generatedSQL, err := insertSQL(c.Table, c.KeySeparator, metrics)
