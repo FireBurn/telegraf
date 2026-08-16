@@ -85,12 +85,16 @@ func (i *Inlong) Close() error {
 }
 
 func (i *Inlong) Write(metrics []telegraf.Metric) error {
+	return i.WriteContext(context.Background(), metrics)
+}
+
+func (i *Inlong) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	for _, metric := range metrics {
 		b, err := i.serializer.Serialize(metric)
 		if err != nil {
 			return fmt.Errorf("could not serialize metric: %w", err)
 		}
-		err = i.producer.Send(context.Background(), dataproxy.Message{
+		err = i.producer.Send(ctx, dataproxy.Message{
 			GroupID:  i.GroupID,
 			StreamID: i.StreamID,
 			Payload:  b,

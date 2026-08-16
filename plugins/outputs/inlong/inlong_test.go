@@ -1,10 +1,51 @@
 package inlong
 
 import (
+	"context"
 	"testing"
+	"time"
 
+	"github.com/apache/inlong/inlong-sdk/dataproxy-sdk-twins/dataproxy-sdk-golang/dataproxy"
 	"github.com/stretchr/testify/require"
+
+	"github.com/influxdata/telegraf/plugins/serializers/influx"
+	"github.com/influxdata/telegraf/testutil"
 )
+
+type blockingProducer struct{}
+
+func (blockingProducer) Send(ctx context.Context, _ dataproxy.Message) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (blockingProducer) SendAsync(context.Context, dataproxy.Message, dataproxy.Callback) {}
+
+func (blockingProducer) Close() {}
+
+func TestWriteContextCancellation(t *testing.T) {
+	plugin := &Inlong{
+		GroupID:    "test",
+		StreamID:   "test",
+		producer:   blockingProducer{},
+		serializer: &influx.Serializer{},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- plugin.WriteContext(ctx, testutil.MockMetrics())
+	}()
+
+	cancel()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
+}
 
 func TestInvalidParameters(t *testing.T) {
 	tests := []struct {
