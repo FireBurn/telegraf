@@ -2,6 +2,7 @@
 package syslog
 
 import (
+	"context"
 	"crypto/tls"
 	_ "embed"
 	"errors"
@@ -57,6 +58,12 @@ func (s *Syslog) Init() error {
 }
 
 func (s *Syslog) Connect() error {
+	return s.ConnectContext(context.Background())
+}
+
+// ConnectContext dials the socket, aborting the dial/handshake when ctx is
+// cancelled. net.Dialer/tls.Dialer are both context-native.
+func (s *Syslog) ConnectContext(ctx context.Context) error {
 	s.initializeSyslogMapper()
 
 	spl := strings.SplitN(s.Address, "://", 2)
@@ -70,10 +77,12 @@ func (s *Syslog) Connect() error {
 	}
 
 	var c net.Conn
+	d := net.Dialer{}
 	if tlsCfg == nil {
-		c, err = net.Dial(spl[0], spl[1])
+		c, err = d.DialContext(ctx, spl[0], spl[1])
 	} else {
-		c, err = tls.Dial(spl[0], spl[1], tlsCfg)
+		tlsDialer := &tls.Dialer{NetDialer: &d, Config: tlsCfg}
+		c, err = tlsDialer.DialContext(ctx, spl[0], spl[1])
 	}
 	if err != nil {
 		return &internal.StartupError{Err: err, Retry: true}
@@ -113,13 +122,28 @@ func (s *Syslog) Close() error {
 	return err
 }
 
-func (s *Syslog) Write(metrics []telegraf.Metric) (err error) {
+func (s *Syslog) Write(metrics []telegraf.Metric) error {
+	return s.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes the given metrics, aborting an in-flight write via a
+// forced deadline when ctx is cancelled. net.Conn has no native context
+// support.
+func (s *Syslog) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if s.Conn == nil {
 		// previous write failed with permanent error and socket was closed.
-		if err := s.Connect(); err != nil {
+		if err := s.ConnectContext(ctx); err != nil {
 			return err
 		}
 	}
+
+	// Capture the connection the watcher is allowed to touch. Re-reading
+	// s.Conn from the watcher would race the error path below, which closes
+	// the connection and may install a replacement.
+	conn := s.Conn
+	stop := internal.CancelConnOnContext(ctx, conn)
+	defer stop()
+
 	for _, metric := range metrics {
 		msg, err := s.mapper.MapMetricToSyslogMessage(metric)
 		if err != nil {
@@ -132,16 +156,27 @@ func (s *Syslog) Write(metrics []telegraf.Metric) (err error) {
 			s.Log.Errorf("Failed to convert syslog message with framing: %v", err)
 			continue
 		}
-		if _, err = s.Conn.Write(msgBytesWithFraming); err != nil {
+		if _, err = conn.Write(msgBytesWithFraming); err != nil {
 			var netErr net.Error
 			if errors.As(err, &netErr) {
+				stop()
 				s.Close()
-				s.Conn = nil
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
 				return fmt.Errorf("closing connection: %w", netErr)
 			}
 			return err
 		}
 	}
+
+	// A cancellation that raced the last successful write leaves the socket
+	// with an expired deadline, which would fail every later write. Drop it.
+	if stop() {
+		s.Close()
+		return ctx.Err()
+	}
+
 	return nil
 }
 

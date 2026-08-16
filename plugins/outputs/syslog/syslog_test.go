@@ -2,6 +2,7 @@ package syslog
 
 import (
 	"bytes"
+	"context"
 	"net"
 	"os"
 	"path/filepath"
@@ -585,4 +586,45 @@ func (s *mockServer) len() int {
 	s.Lock()
 	defer s.Unlock()
 	return s.data.Len()
+}
+
+func TestWriteContextCancelUnblocksBlockedWrite(t *testing.T) {
+	// net.Pipe is fully synchronous: a Write blocks until the peer Reads,
+	// giving a deterministic (non-timing-dependent) blocked write.
+	client, server := net.Pipe()
+	defer server.Close()
+
+	s := newSyslog()
+	require.NoError(t, s.Init())
+	s.initializeSyslogMapper()
+	s.Conn = client
+	s.Log = testutil.Logger{}
+
+	m := metric.New(
+		"cpu",
+		map[string]string{},
+		map[string]interface{}{"value": 3.14},
+		time.Unix(0, 0),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.WriteContext(ctx, []telegraf.Metric{m})
+	}()
+
+	// Let the write actually reach the blocked conn.Write before cancelling.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.Error(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("WriteContext did not return promptly after context cancellation")
+	}
+
+	// The connection must be dropped so the next write reconnects rather
+	// than reusing a poisoned one.
+	require.Nil(t, s.Conn)
 }
