@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -113,12 +114,45 @@ func (m *mqttv311Client) Connect() (bool, error) {
 	return false, nil
 }
 
-func (m *mqttv311Client) Publish(topic string, body []byte) error {
-	token := m.client.Publish(topic, byte(m.qos), m.retain, body)
-	if !token.WaitTimeout(m.timeout) {
+// Publish sends body to topic, returning promptly once ctx is cancelled.
+// paho.mqtt.golang's Client.Publish has no context support and can itself
+// block (bounded internally by WriteTimeout, default 30s) queuing the
+// message before it even returns a Token, so that call is raced in a
+// goroutine; the wait for the token to complete (broker ack) is then raced
+// again. Neither race requires detaching/closing the connection on
+// cancellation: Publish is safe to have in flight concurrently with other
+// publishes on the same client, and an abandoned call/token is cleaned up
+// by the client's own internal bookkeeping once it eventually completes.
+func (m *mqttv311Client) Publish(ctx context.Context, topic string, body []byte) error {
+	tokenCh := make(chan mqttv3.Token, 1)
+	go func() {
+		tokenCh <- m.client.Publish(topic, byte(m.qos), m.retain, body)
+	}()
+
+	select {
+	case token := <-tokenCh:
+		return m.waitToken(ctx, token)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *mqttv311Client) waitToken(ctx context.Context, token mqttv3.Token) error {
+	var timeoutCh <-chan time.Time
+	if m.timeout > 0 {
+		timer := time.NewTimer(m.timeout)
+		defer timer.Stop()
+		timeoutCh = timer.C
+	}
+
+	select {
+	case <-token.Done():
+		return token.Error()
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timeoutCh:
 		return internal.ErrTimeout
 	}
-	return token.Error()
 }
 
 func (m *mqttv311Client) SubscribeMultiple(filters map[string]byte, callback mqttv3.MessageHandler) error {

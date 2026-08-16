@@ -135,19 +135,39 @@ func (m *mqttv5Client) Connect() (bool, error) {
 	return false, client.AwaitConnection(context.Background())
 }
 
-func (m *mqttv5Client) Publish(topic string, body []byte) error {
-	ctx, cancel := context.WithTimeout(context.Background(), m.timeout)
-	defer cancel()
+// Publish sends body to topic, returning promptly once ctx is cancelled.
+// paho.golang/paho's Client.Publish accepts a context and honors it while
+// waiting for the broker's acknowledgement on QoS 1/2, but for QoS 0 it
+// performs a direct, uninterruptible connection write, so the whole call is
+// also raced in a goroutine as a backstop. Abandoning that goroutine on
+// cancellation does not corrupt the client: the session/connection state is
+// shared safely across concurrent publishes and is updated by the client's
+// own read loop regardless of whether this caller is still waiting.
+func (m *mqttv5Client) Publish(ctx context.Context, topic string, body []byte) error {
+	if m.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, m.timeout)
+		defer cancel()
+	}
 
-	_, err := m.client.Publish(ctx, &mqttv5.Publish{
-		Topic:      topic,
-		QoS:        byte(m.qos),
-		Retain:     m.retain,
-		Payload:    body,
-		Properties: m.properties,
-	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.client.Publish(ctx, &mqttv5.Publish{
+			Topic:      topic,
+			QoS:        byte(m.qos),
+			Retain:     m.retain,
+			Payload:    body,
+			Properties: m.properties,
+		})
+		done <- err
+	}()
 
-	return err
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (*mqttv5Client) SubscribeMultiple(filters map[string]byte, callback paho.MessageHandler) error {

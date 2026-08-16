@@ -2,6 +2,7 @@
 package mqtt
 
 import (
+	"context"
 	// Blank import to support go:embed compile directive
 	_ "embed"
 	"errors"
@@ -116,6 +117,18 @@ func (m *MQTT) Init() error {
 }
 
 func (m *MQTT) Connect() error {
+	return m.ConnectContext(context.Background())
+}
+
+// ConnectContext connects to the broker, returning early if ctx is
+// cancelled. Neither underlying client exposes a connect that is guaranteed
+// to abort on our caller-provided ctx -- the v3 client's Connect blocks on
+// token.Wait() with no timeout at all, and while the v5 client's
+// AwaitConnection accepts a context, the connection dial it awaits does not
+// derive from it -- so the whole connect is raced in a goroutine and
+// abandoned on cancellation, closing whatever client it eventually
+// produces instead of installing it.
+func (m *MQTT) ConnectContext(ctx context.Context) error {
 	m.Lock()
 	defer m.Unlock()
 
@@ -125,10 +138,29 @@ func (m *MQTT) Connect() error {
 	if err != nil {
 		return err
 	}
-	m.client = client
 
-	_, err = m.client.Connect()
-	return err
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := client.Connect()
+		resultCh <- err
+	}()
+
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			return err
+		}
+		m.client = client
+		return nil
+	case <-ctx.Done():
+		go func() {
+			<-resultCh
+			if err := client.Close(); err != nil {
+				m.Log.Errorf("Error closing connection abandoned due to context cancellation: %v", err)
+			}
+		}()
+		return ctx.Err()
+	}
 }
 
 func (m *MQTT) SetSerializer(serializer telegraf.Serializer) {
@@ -143,7 +175,7 @@ func (m *MQTT) Close() error {
 	if len(m.homieSeen) > 0 {
 		for topic := range m.homieSeen {
 			//nolint:errcheck // We will ignore potential errors as we cannot do anything here
-			m.client.Publish(topic+"/$state", []byte("lost"))
+			m.client.Publish(context.Background(), topic+"/$state", []byte("lost"))
 		}
 		// Give the messages some time to settle
 		time.Sleep(100 * time.Millisecond)
@@ -152,6 +184,11 @@ func (m *MQTT) Close() error {
 }
 
 func (m *MQTT) Write(metrics []telegraf.Metric) error {
+	return m.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext publishes the metrics, returning early if ctx is cancelled.
+func (m *MQTT) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	m.Lock()
 	defer m.Unlock()
 	if len(metrics) == 0 {
@@ -174,7 +211,12 @@ func (m *MQTT) Write(metrics []telegraf.Metric) error {
 	}
 
 	for _, msg := range topicMessages {
-		if err := m.client.Publish(msg.topic, msg.payload); err != nil {
+		if err := m.client.Publish(ctx, msg.topic, msg.payload); err != nil {
+			// A cancelled context always takes precedence over the
+			// retry/drop handling below.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			// We do receive a timeout error if the remote broker is down,
 			// so let's retry the metrics in this case and drop them otherwise.
 			if errors.Is(err, internal.ErrTimeout) {

@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/url"
@@ -48,7 +49,9 @@ type MqttConfig struct {
 // The protocol specific clients must implement this interface
 type Client interface {
 	Connect() (bool, error)
-	Publish(topic string, data []byte) error
+	// Publish sends data to topic, returning promptly once ctx is
+	// cancelled even if the broker has not acknowledged the message.
+	Publish(ctx context.Context, topic string, data []byte) error
 	SubscribeMultiple(filters map[string]byte, callback paho.MessageHandler) error
 	AddRoute(topic string, callback paho.MessageHandler)
 	Close() error

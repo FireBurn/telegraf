@@ -335,3 +335,21 @@ times for the colliding items.
 [HomieSpecV4]: https://homieiot.github.io/specification/spec-core-v4_0_0
 [GoTemplates]: https://pkg.go.dev/text/template
 [HomieSpecV4TopicIDs]: https://homieiot.github.io/specification/#topic-ids
+
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds a single connect attempt (dialing the broker and
+completing the MQTT handshake, if not already connected) or a single publish
+attempt (queuing and, depending on QoS, waiting for the broker's
+acknowledgement) for each topic message in the batch. Each topic message is
+published as a separate attempt, so `write_timeout` bounds each attempt
+individually rather than the whole `Write` call.
+
+When a write is cancelled, the delivery outcome of the in-flight message is
+unknown: the broker may or may not have received/acknowledged it. Telegraf
+keeps the batch for retry, so a cancelled write can result in duplicate
+metrics.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
