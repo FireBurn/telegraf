@@ -2,6 +2,7 @@
 package riemann
 
 import (
+	"context"
 	_ "embed"
 	"fmt"
 	"net/url"
@@ -40,19 +41,46 @@ func (*Riemann) SampleConfig() string {
 }
 
 func (r *Riemann) Connect() error {
+	return r.ConnectContext(context.Background())
+}
+
+// ConnectContext dials the Riemann server, returning early if ctx is
+// cancelled. raidman.DialWithTimeout has no context support, but is
+// already bounded by r.Timeout, so a cancelled dial abandons the
+// in-progress call (bounded by r.Timeout) and closes any client it
+// eventually produces.
+func (r *Riemann) ConnectContext(ctx context.Context) error {
 	parsedURL, err := url.Parse(r.URL)
 	if err != nil {
 		return err
 	}
 
-	client, err := raidman.DialWithTimeout(parsedURL.Scheme, parsedURL.Host, time.Duration(r.Timeout))
-	if err != nil {
-		r.client = nil
-		return err
+	type dialResult struct {
+		client *raidman.Client
+		err    error
 	}
+	resultCh := make(chan dialResult, 1)
+	go func() {
+		client, err := raidman.DialWithTimeout(parsedURL.Scheme, parsedURL.Host, time.Duration(r.Timeout))
+		resultCh <- dialResult{client, err}
+	}()
 
-	r.client = client
-	return nil
+	select {
+	case res := <-resultCh:
+		if res.err != nil {
+			r.client = nil
+			return res.err
+		}
+		r.client = res.client
+		return nil
+	case <-ctx.Done():
+		go func() {
+			if res := <-resultCh; res.client != nil {
+				res.client.Close()
+			}
+		}()
+		return ctx.Err()
+	}
 }
 
 func (r *Riemann) Close() (err error) {
@@ -64,12 +92,24 @@ func (r *Riemann) Close() (err error) {
 }
 
 func (r *Riemann) Write(metrics []telegraf.Metric) error {
+	return r.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext sends events to Riemann, returning early if ctx is
+// cancelled. raidman.Client has no context support, and its SendMulti
+// already applies its own SetDeadline(r.Timeout) before writing/reading,
+// so a cancelled write abandons the in-progress call (bounded by
+// r.Timeout) rather than interrupting it mid-flight -- the client holds
+// its internal lock for the call's duration, so forcing Close() from this
+// goroutine would just block behind that lock instead of unblocking
+// anything.
+func (r *Riemann) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if len(metrics) == 0 {
 		return nil
 	}
 
 	if r.client == nil {
-		if err := r.Connect(); err != nil {
+		if err := r.ConnectContext(ctx); err != nil {
 			return fmt.Errorf("failed to (re)connect to Riemann: %w", err)
 		}
 	}
@@ -81,11 +121,29 @@ func (r *Riemann) Write(metrics []telegraf.Metric) error {
 		events = append(events, evs...)
 	}
 
-	if err := r.client.SendMulti(events); err != nil {
-		r.Close()
-		return fmt.Errorf("failed to send riemann message: %w", err)
+	client := r.client
+	done := make(chan error, 1)
+	go func() {
+		done <- client.SendMulti(events)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			r.Close()
+			return fmt.Errorf("failed to send riemann message: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		// Detach this client rather than blocking on Close() here; close
+		// it in the background once the abandoned call returns.
+		r.client = nil
+		go func() {
+			<-done
+			client.Close()
+		}()
+		return ctx.Err()
 	}
-	return nil
 }
 
 func (r *Riemann) buildRiemannEvents(m telegraf.Metric) []*raidman.Event {

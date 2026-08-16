@@ -16,6 +16,22 @@ plugin ordering. See [CONFIGURATION.md][CONFIGURATION.md] for more details.
 
 [CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. The
+underlying Riemann client has no context support, and its own send call is
+already bounded by this plugin's `timeout` setting, so on cancellation
+Telegraf abandons the in-flight send (bounded by `timeout`, not interrupted
+immediately) and reconnects on the next write.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: the Riemann server may or may not have received the events.
+Telegraf keeps the batch for retry, so a cancelled write can result in
+duplicate events.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Configuration
 
 ```toml @sample.conf
