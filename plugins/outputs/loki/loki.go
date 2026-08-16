@@ -117,6 +117,11 @@ func (l *Loki) Close() error {
 }
 
 func (l *Loki) Write(metrics []telegraf.Metric) error {
+	return l.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes the metrics to Loki. It can be cancelled via the context.
+func (l *Loki) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	s := Streams{}
 
 	sort.SliceStable(metrics, func(i, j int) bool {
@@ -144,10 +149,10 @@ func (l *Loki) Write(metrics []telegraf.Metric) error {
 		s.insertLog(tags, Log{strconv.FormatInt(m.Time().UnixNano(), 10), line})
 	}
 
-	return l.writeMetrics(s)
+	return l.writeMetrics(ctx, s)
 }
 
-func (l *Loki) writeMetrics(s Streams) error {
+func (l *Loki) writeMetrics(ctx context.Context, s Streams) error {
 	bs, err := json.Marshal(s)
 	if err != nil {
 		return fmt.Errorf("json.Marshal: %w", err)
@@ -161,7 +166,7 @@ func (l *Loki) writeMetrics(s Streams) error {
 		reqBodyBuffer = rc
 	}
 
-	req, err := http.NewRequest(http.MethodPost, l.url, reqBodyBuffer)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, l.url, reqBodyBuffer)
 	if err != nil {
 		return err
 	}

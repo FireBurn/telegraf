@@ -2,6 +2,7 @@ package loki
 
 import (
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -58,6 +59,37 @@ func getOutOfOrderMetrics() []telegraf.Metric {
 			},
 			time.Unix(456, 0),
 		),
+	}
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	unblock := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+	defer close(unblock)
+
+	u, err := url.Parse("http://" + ts.Listener.Addr().String())
+	require.NoError(t, err)
+
+	plugin := &Loki{Domain: u.String()}
+	require.NoError(t, plugin.Connect())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- plugin.WriteContext(ctx, []telegraf.Metric{getMetric()})
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
 	}
 }
 
