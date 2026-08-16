@@ -46,3 +46,22 @@ plugin ordering. See [CONFIGURATION.md][CONFIGURATION.md] for more details.
   # If not set use values from the standard
   # metric_url = "https://metric-api.newrelic.com/metric/v1"
 ```
+
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. This
+plugin sends data via the New Relic Go telemetry SDK's `Harvester`,
+configured with a zero harvest period so that `Write` synchronously calls
+`Harvester.HarvestNow` on every write rather than relying on the SDK's own
+periodic background dispatch. `HarvestNow` accepts a `context.Context`
+natively and threads it down to the actual HTTP request(s) it issues, so the
+`write_timeout` deadline bounds real delivery to the New Relic backend, not
+just the in-memory enqueueing of metrics into the harvester.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: the destination may or may not have received the metrics. Telegraf
+keeps the batch for retry, so a cancelled write can result in duplicate
+metrics.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins

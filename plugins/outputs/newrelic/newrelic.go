@@ -87,6 +87,18 @@ func (nr *NewRelic) Close() error {
 
 // Write takes in group of points to be written to the Output
 func (nr *NewRelic) Write(metrics []telegraf.Metric) error {
+	return nr.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext takes in group of points to be written to the Output,
+// returning promptly when ctx is cancelled.
+//
+// The New Relic telemetry SDK's Harvester.HarvestNow accepts a context
+// natively and threads it down to the individual HTTP requests it issues
+// (see harvestRequest/postData in the SDK), so ctx bounds the actual
+// delivery attempt to the New Relic backend, not just the in-memory
+// enqueueing that happens above in this function.
+func (nr *NewRelic) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	nr.errorCount = 0
 	nr.savedErrors = make(map[int]interface{})
 
@@ -141,7 +153,7 @@ func (nr *NewRelic) Write(metrics []telegraf.Metric) error {
 	// By default, the Harvester sends metrics and spans to the New Relic
 	// backend every 5 seconds.  You can force data to be sent at any time
 	// using HarvestNow.
-	nr.harvestor.HarvestNow(context.Background())
+	nr.harvestor.HarvestNow(ctx)
 
 	// Check if we encountered errors
 	if nr.errorCount != 0 {

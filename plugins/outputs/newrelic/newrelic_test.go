@@ -1,7 +1,11 @@
 package newrelic
 
 import (
+	"context"
 	"math"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,6 +130,43 @@ func TestNewRelic_Write(t *testing.T) {
 				t.Errorf("NewRelic.Write() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	// The New Relic Harvester's HarvestNow(ctx) threads ctx down to the
+	// actual HTTP request it issues to the metrics endpoint, so blocking
+	// that endpoint and cancelling ctx should make WriteContext return
+	// promptly, without waiting for the blocked request to complete.
+	unblock := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	defer close(unblock)
+
+	plugin := &NewRelic{
+		InsightsKey: "dummyTestKey",
+		MetricURL:   ts.URL,
+		Timeout:     config.Duration(30 * time.Second),
+	}
+	require.NoError(t, plugin.Connect())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- plugin.WriteContext(ctx, testutil.MockMetrics())
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.Error(t, err)
+		require.True(t, strings.Contains(err.Error(), "context canceled"), "expected error to mention context cancellation, got: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
 	}
 }
 
