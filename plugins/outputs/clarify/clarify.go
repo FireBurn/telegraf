@@ -82,9 +82,12 @@ func (*Clarify) Connect() error {
 }
 
 func (c *Clarify) Write(metrics []telegraf.Metric) error {
+	return c.WriteContext(context.Background(), metrics)
+}
+
+func (c *Clarify) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	frame, signals := c.processMetrics(metrics)
 
-	ctx := context.Background()
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(c.Timeout))
 	defer cancel()
 

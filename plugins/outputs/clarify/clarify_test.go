@@ -302,6 +302,30 @@ func TestTimeout(t *testing.T) {
 	require.ErrorIs(t, err, errTimeout)
 }
 
+func TestWriteContextCancellation(t *testing.T) {
+	clfy := &Clarify{
+		Log:     testutil.Logger{},
+		Timeout: config.Duration(time.Minute),
+		client: clarify.NewClient("c8bvu9fqfsjctpv7b6fg", &MockHandler{
+			sleep:      time.Minute,
+			jsonResult: validResponse,
+		}),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- clfy.WriteContext(ctx, nil) }()
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, errTimeout)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return promptly after context cancellation")
+	}
+}
+
 func TestInit(t *testing.T) {
 	username := config.NewSecret([]byte("user"))
 
