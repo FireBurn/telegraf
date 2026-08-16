@@ -185,6 +185,14 @@ func (h *Health) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 }
 
 // Write runs all checks over the metric batch and adjust health state.
+//
+// This plugin does not implement OutputWithContext/OutputWithConnectContext
+// (see docs/specs/tsd-012-output-context-aware-write.md): Write only runs
+// local, in-memory checkers and updates state guarded by h.mu, and Connect
+// only binds a local listener (net.Listen/tls.Listen) before handing off to
+// a background goroutine that serves the health-check HTTP server. Neither
+// makes an outbound, potentially-hanging network call, so there is nothing
+// for a write_timeout deadline to usefully bound.
 func (h *Health) Write(metrics []telegraf.Metric) error {
 	ts := time.Now()
 	healthy := true
