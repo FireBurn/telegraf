@@ -3,6 +3,7 @@ package librato
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -80,6 +81,11 @@ func (l *Librato) Connect() error {
 }
 
 func (l *Librato) Write(metrics []telegraf.Metric) error {
+	return l.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes the metrics to Librato. It can be cancelled via the context.
+func (l *Librato) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if len(metrics) == 0 {
 		return nil
 	}
@@ -104,7 +110,7 @@ func (l *Librato) Write(metrics []telegraf.Metric) error {
 	// make sure we send a batch of maximum 300
 	sizeBatch := 300
 	for start := 0; start < metricCounter; start += sizeBatch {
-		err := l.writeBatch(start, sizeBatch, metricCounter, tempGauges)
+		err := l.writeBatch(ctx, start, sizeBatch, metricCounter, tempGauges)
 		if err != nil {
 			return err
 		}
@@ -113,7 +119,7 @@ func (l *Librato) Write(metrics []telegraf.Metric) error {
 	return nil
 }
 
-func (l *Librato) writeBatch(start, sizeBatch, metricCounter int, tempGauges []*Gauge) error {
+func (l *Librato) writeBatch(ctx context.Context, start, sizeBatch, metricCounter int, tempGauges []*Gauge) error {
 	lmetrics := LMetrics{}
 	end := start + sizeBatch
 	if end > metricCounter {
@@ -129,7 +135,8 @@ func (l *Librato) writeBatch(start, sizeBatch, metricCounter int, tempGauges []*
 
 	l.Log.Debugf("Librato request: %v", string(metricsBytes))
 
-	req, err := http.NewRequest(
+	req, err := http.NewRequestWithContext(
+		ctx,
 		"POST",
 		l.APIUrl,
 		bytes.NewBuffer(metricsBytes))

@@ -1,6 +1,7 @@
 package librato
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,38 @@ func newTestLibrato(testURL string) *Librato {
 	l := NewLibrato(testURL)
 	l.Log = testutil.Logger{}
 	return l
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	unblock := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	defer close(unblock)
+
+	l := newTestLibrato(ts.URL)
+	l.APIUser = config.NewSecret([]byte("telegraf@influxdb.com"))
+	l.APIToken = config.NewSecret([]byte("123456"))
+	require.NoError(t, l.Connect())
+
+	m := metric.New("test", map[string]string{"host": "test-host"}, map[string]interface{}{"value": 1.0}, time.Now())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- l.WriteContext(ctx, []telegraf.Metric{m})
+	}()
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
 }
 
 func TestUriOverride(t *testing.T) {
