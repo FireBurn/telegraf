@@ -51,6 +51,12 @@ func (*KinesisOutput) SampleConfig() string {
 }
 
 func (k *KinesisOutput) Connect() error {
+	return k.ConnectContext(context.Background())
+}
+
+// ConnectContext connects to Kinesis, passing ctx through to the stream
+// summary check so a stuck connection attempt can be cancelled.
+func (k *KinesisOutput) ConnectContext(ctx context.Context) error {
 	if k.Partition == nil {
 		k.Log.Error("Deprecated partitionkey configuration in use, please consider using outputs.kinesis.partition")
 	}
@@ -72,7 +78,7 @@ func (k *KinesisOutput) Connect() error {
 
 	svc := kinesis.NewFromConfig(cfg)
 
-	_, err = svc.DescribeStreamSummary(context.Background(), &kinesis.DescribeStreamSummaryInput{
+	_, err = svc.DescribeStreamSummary(ctx, &kinesis.DescribeStreamSummaryInput{
 		StreamName: aws.String(k.StreamName),
 	})
 	k.svc = svc
@@ -87,14 +93,14 @@ func (k *KinesisOutput) SetSerializer(serializer telegraf.Serializer) {
 	k.serializer = serializer
 }
 
-func (k *KinesisOutput) writeKinesis(r []types.PutRecordsRequestEntry) time.Duration {
+func (k *KinesisOutput) writeKinesis(ctx context.Context, r []types.PutRecordsRequestEntry) time.Duration {
 	start := time.Now()
 	payload := &kinesis.PutRecordsInput{
 		Records:    r,
 		StreamName: aws.String(k.StreamName),
 	}
 
-	resp, err := k.svc.PutRecords(context.Background(), payload)
+	resp, err := k.svc.PutRecords(ctx, payload)
 	if err != nil {
 		k.Log.Errorf("Unable to write to Kinesis : %s", err.Error())
 		return time.Since(start)
@@ -139,6 +145,12 @@ func (k *KinesisOutput) getPartitionKey(metric telegraf.Metric) string {
 }
 
 func (k *KinesisOutput) Write(metrics []telegraf.Metric) error {
+	return k.WriteContext(context.Background(), metrics)
+}
+
+// WriteContext writes the metrics to Kinesis, passing ctx through to
+// PutRecords so a stuck write can be cancelled.
+func (k *KinesisOutput) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	var sz uint32
 
 	if len(metrics) == 0 {
@@ -164,14 +176,14 @@ func (k *KinesisOutput) Write(metrics []telegraf.Metric) error {
 
 		r = append(r, d)
 		if sz == maxRecordsPerRequest {
-			elapsed := k.writeKinesis(r)
+			elapsed := k.writeKinesis(ctx, r)
 			k.Log.Debugf("Wrote a %d point batch to Kinesis in %+v.", sz, elapsed)
 			sz = 0
 			r = nil
 		}
 	}
 	if sz > 0 {
-		elapsed := k.writeKinesis(r)
+		elapsed := k.writeKinesis(ctx, r)
 		k.Log.Debugf("Wrote a %d point batch to Kinesis in %+v.", sz, elapsed)
 	}
 

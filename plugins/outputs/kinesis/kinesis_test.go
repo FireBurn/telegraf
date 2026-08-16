@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
@@ -115,7 +116,7 @@ func TestWriteKinesis_WhenSuccess(t *testing.T) {
 		svc:        svc,
 	}
 
-	elapsed := k.writeKinesis(records)
+	elapsed := k.writeKinesis(t.Context(), records)
 	require.GreaterOrEqual(t, elapsed.Nanoseconds(), zero)
 
 	svc.AssertRequests(t, []*kinesis.PutRecordsInput{
@@ -151,7 +152,7 @@ func TestWriteKinesis_WhenRecordErrors(t *testing.T) {
 		svc:        svc,
 	}
 
-	elapsed := k.writeKinesis(records)
+	elapsed := k.writeKinesis(t.Context(), records)
 	require.GreaterOrEqual(t, elapsed.Nanoseconds(), zero)
 
 	svc.AssertRequests(t, []*kinesis.PutRecordsInput{
@@ -180,7 +181,7 @@ func TestWriteKinesis_WhenServiceError(t *testing.T) {
 		svc:        svc,
 	}
 
-	elapsed := k.writeKinesis(records)
+	elapsed := k.writeKinesis(t.Context(), records)
 	require.GreaterOrEqual(t, elapsed.Nanoseconds(), zero)
 
 	svc.AssertRequests(t, []*kinesis.PutRecordsInput{
@@ -438,6 +439,63 @@ func TestWrite_SerializerError(t *testing.T) {
 			},
 		},
 	})
+}
+
+// blockingKinesisPutRecords blocks in PutRecords until its context is
+// cancelled or release is closed, used to verify WriteContext returns
+// promptly on cancellation.
+type blockingKinesisPutRecords struct {
+	reached chan struct{}
+	release chan struct{}
+}
+
+func (m *blockingKinesisPutRecords) PutRecords(ctx context.Context, _ *kinesis.PutRecordsInput, _ ...func(*kinesis.Options)) (*kinesis.PutRecordsOutput, error) {
+	m.reached <- struct{}{}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-m.release:
+		return &kinesis.PutRecordsOutput{FailedRecordCount: aws.Int32(0)}, nil
+	}
+}
+
+func TestWriteContextCancellation(t *testing.T) {
+	svc := &blockingKinesisPutRecords{reached: make(chan struct{}, 1), release: make(chan struct{})}
+	defer close(svc.release)
+
+	serializer := &influx.Serializer{}
+	require.NoError(t, serializer.Init())
+
+	k := KinesisOutput{
+		Log: testutil.Logger{},
+		Partition: &Partition{
+			Method: "static",
+			Key:    testPartitionKey,
+		},
+		StreamName: testStreamName,
+		serializer: serializer,
+		svc:        svc,
+	}
+
+	metric, _ := createTestMetric(t, "metric1", serializer)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() { result <- k.WriteContext(ctx, []telegraf.Metric{metric}) }()
+
+	select {
+	case <-svc.reached:
+	case <-time.After(time.Second):
+		t.Fatal("PutRecords was not called")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		require.NoError(t, err) // writeKinesis logs the error but WriteContext itself always returns nil
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteContext did not return after context cancellation")
+	}
 }
 
 type mockKinesisPutRecordsResponse struct {

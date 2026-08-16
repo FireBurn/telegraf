@@ -44,6 +44,20 @@ plugin ordering. See [CONFIGURATION.md][CONFIGURATION.md] for more details.
 
 [CONFIGURATION.md]: ../../../docs/CONFIGURATION.md#plugins
 
+## Write timeout support
+
+This plugin implements the optional context-aware output interface and
+therefore supports the [`write_timeout`][write_timeout] output option. When
+set, the deadline bounds the stream summary check and the `PutRecords`
+call(s) made for one write.
+
+When a write is cancelled, the delivery outcome of the in-flight batch is
+unknown: Kinesis may or may not have received some or all of the records.
+Telegraf keeps the batch for retry, so a cancelled write can result in
+duplicate records.
+
+[write_timeout]: ../../../docs/CONFIGURATION.md#output-plugins
+
 ## Configuration
 
 ```toml @sample.conf
