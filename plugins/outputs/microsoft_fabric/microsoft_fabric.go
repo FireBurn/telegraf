@@ -2,6 +2,7 @@
 package microsoft_fabric
 
 import (
+	"context"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -20,6 +21,7 @@ var sampleConfig string
 type fabric interface {
 	Connect() error
 	Write(metrics []telegraf.Metric) error
+	WriteContext(ctx context.Context, metrics []telegraf.Metric) error
 	Close() error
 }
 
@@ -83,6 +85,10 @@ func (m *MicrosoftFabric) Connect() error {
 
 func (m *MicrosoftFabric) Write(metrics []telegraf.Metric) error {
 	return m.output.Write(metrics)
+}
+
+func (m *MicrosoftFabric) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
+	return m.output.WriteContext(ctx, metrics)
 }
 
 func init() {

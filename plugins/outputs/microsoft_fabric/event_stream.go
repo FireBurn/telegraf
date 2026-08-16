@@ -104,10 +104,10 @@ func (e *eventstream) Close() error {
 }
 
 func (e *eventstream) Write(metrics []telegraf.Metric) error {
-	// This context is only used for creating the batches which should not timeout as this is
-	// not an I/O operation. Therefore avoid setting a timeout here.
-	ctx := context.Background()
+	return e.WriteContext(context.Background(), metrics)
+}
 
+func (e *eventstream) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	// Iterate over the metrics and group them to batches
 	batchOptions := e.options
 	batches := make(map[string]*azeventhubs.EventDataBatch)

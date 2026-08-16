@@ -1,16 +1,44 @@
 package microsoft_fabric
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azeventhubs/v2"
 	"github.com/stretchr/testify/require"
 
+	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/plugins/common/adx"
 	"github.com/influxdata/telegraf/testutil"
 )
+
+type fakeFabric struct {
+	writeCtx context.Context
+}
+
+func (*fakeFabric) Connect() error { return nil }
+func (*fakeFabric) Close() error   { return nil }
+func (*fakeFabric) Write(metrics []telegraf.Metric) error {
+	return nil
+}
+func (f *fakeFabric) WriteContext(ctx context.Context, _ []telegraf.Metric) error {
+	f.writeCtx = ctx
+	return ctx.Err()
+}
+
+func TestWriteContextDelegation(t *testing.T) {
+	inner := &fakeFabric{}
+	plugin := &MicrosoftFabric{output: inner}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := plugin.WriteContext(ctx, nil)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Same(t, ctx, inner.writeCtx)
+}
 
 func TestInitFail(t *testing.T) {
 	tests := []struct {

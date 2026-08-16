@@ -1,6 +1,7 @@
 package microsoft_fabric
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -97,17 +98,21 @@ func (e *eventhouse) Connect() error {
 }
 
 func (e *eventhouse) Write(metrics []telegraf.Metric) error {
+	return e.WriteContext(context.Background(), metrics)
+}
+
+func (e *eventhouse) WriteContext(ctx context.Context, metrics []telegraf.Metric) error {
 	if e.MetricsGrouping == adx.TablePerMetric {
-		return e.writeTablePerMetric(metrics)
+		return e.writeTablePerMetric(ctx, metrics)
 	}
-	return e.writeSingleTable(metrics)
+	return e.writeSingleTable(ctx, metrics)
 }
 
 func (e *eventhouse) Close() error {
 	return e.client.Close()
 }
 
-func (e *eventhouse) writeTablePerMetric(metrics []telegraf.Metric) error {
+func (e *eventhouse) writeTablePerMetric(ctx context.Context, metrics []telegraf.Metric) error {
 	tableMetricGroups := make(map[string][]byte)
 	// Group metrics by name and serialize them
 	for _, m := range metrics {
@@ -126,7 +131,7 @@ func (e *eventhouse) writeTablePerMetric(metrics []telegraf.Metric) error {
 	// Push the metrics for each table
 	format := azkustoingest.FileFormat(azkustoingest.JSON)
 	for tableName, tableMetrics := range tableMetricGroups {
-		if err := e.client.PushMetrics(format, tableName, tableMetrics); err != nil {
+		if err := e.client.PushMetrics(ctx, format, tableName, tableMetrics); err != nil {
 			return err
 		}
 	}
@@ -134,7 +139,7 @@ func (e *eventhouse) writeTablePerMetric(metrics []telegraf.Metric) error {
 	return nil
 }
 
-func (e *eventhouse) writeSingleTable(metrics []telegraf.Metric) error {
+func (e *eventhouse) writeSingleTable(ctx context.Context, metrics []telegraf.Metric) error {
 	// serialise each metric in metrics - store in byte[]
 	metricsArray := make([]byte, 0)
 	for _, m := range metrics {
@@ -147,7 +152,7 @@ func (e *eventhouse) writeSingleTable(metrics []telegraf.Metric) error {
 
 	// push metrics to a single table
 	format := azkustoingest.FileFormat(azkustoingest.JSON)
-	err := e.client.PushMetrics(format, e.TableName, metricsArray)
+	err := e.client.PushMetrics(ctx, format, e.TableName, metricsArray)
 	return err
 }
 
